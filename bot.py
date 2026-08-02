@@ -5,7 +5,6 @@ import time
 import json
 import logging
 import threading
-import concurrent.futures
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # 1. WEBSERVER FOR RENDER HEALTH CHECKS
@@ -32,11 +31,8 @@ from telebot import types
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# IMPORTANT: You MUST set BOT_TOKEN in your Render Environment Variables. Do NOT hardcode tokens!
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-if not BOT_TOKEN:
-    logging.error("BOT_TOKEN environment variable is not set!")
-    exit(1)
+DEFAULT_BOT_TOKEN = "8888660501:AAGvIRYpwoQDn6B3JhLNyzNQg2lvoGtDBHc"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", DEFAULT_BOT_TOKEN)
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
@@ -78,12 +74,15 @@ def enhance_newspaper_image(pil_img):
 
 def process_images_to_pdf(image_bytes_list, layout_mode="1_per_page"):
     pdf_pages = []
+    
     for b in image_bytes_list:
         try:
             img = Image.open(io.BytesIO(b))
             if img.mode != 'RGB':
                 img = img.convert('RGB')
+            
             img.thumbnail((A4_WIDTH, A4_HEIGHT), Image.Resampling.LANCZOS)
+
             if layout_mode == "newspaper":
                 enhanced = enhance_newspaper_image(img)
                 filled_img = ImageOps.fit(enhanced, (A4_WIDTH, A4_HEIGHT), Image.Resampling.LANCZOS)
@@ -109,120 +108,73 @@ def process_images_to_pdf(image_bytes_list, layout_mode="1_per_page"):
         return output_buffer
     return None
 
-# --- UPDATED MULTI-METHOD THREADS SCRAPER (FIXES 'lsd' issues) ---
+# --- ULTIMATE THREADS SCRAPER (HANDLES THREADS.COM / SHARE LINKS / OPENGRAPH) ---
 def extract_images_from_threads(threads_url):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    mobile_headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
     }
-    
-    img_urls = []
-    image_bytes_list = []
 
-    # 1. Resolve short /share/ redirects to full URLs
+    # 1. Convert app share links (threads.com/share/...) into real target URLs
     try:
         if "/share/" in threads_url:
-            res = requests.head(threads_url, headers=headers, allow_redirects=True, timeout=8)
+            res = requests.get(threads_url, headers=mobile_headers, allow_redirects=True, timeout=10)
             threads_url = res.url
     except Exception as e:
         logging.error(f"Redirect resolution failed: {e}")
 
-    # 2. Extract Post Code
+    # 2. Extract code from URL (handles post, t, share)
     match = re.search(r'/(?:post|t|share)/([A-Za-z0-9_-]+)', threads_url)
     if not match:
-        logging.error(f"Could not extract code from URL: {threads_url}")
+        logging.error(f"Could not extract post shortcode from URL: {threads_url}")
         return []
+    
     code = match.group(1)
+    img_urls = []
 
-    # Method 1: Embed Page Scrape
+    # Method 1: Scrape Embed HTML
     try:
         embed_url = f"https://www.threads.net/t/{code}/embed"
-        embed_headers = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15"}
-        res = requests.get(embed_url, headers=embed_headers, timeout=8)
+        res = requests.get(embed_url, headers=mobile_headers, timeout=8)
         if res.status_code == 200:
             found_urls = re.findall(r'https://scontent[^\s"\'<]+', res.text)
             for u in found_urls:
                 clean_u = u.replace('\\u0026', '&').replace('\\/', '/')
+                # Filter out profile pictures & icons
                 if not any(x in clean_u for x in ['s150x150', 's320x320', 'p150x150', '150x150']):
                     if clean_u not in img_urls:
                         img_urls.append(clean_u)
     except Exception as e:
         logging.error(f"Embed method error: {e}")
 
-    # Method 2: GraphQL Fallback (Dynamic LSD extraction to fix 403 errors)
+    # Method 2: Open Graph Meta Tag Scraping (Fallback)
     if not img_urls:
         try:
-            session = requests.Session()
-            session.headers.update(headers)
-            
-            # Step A: Get a fresh LSD token from the page
-            page_res = session.get(threads_url, timeout=8)
-            soup = BeautifulSoup(page_res.text, 'html.parser')
-            
-            lsd = None
-            meta_lsd = soup.find('meta', {'name': 'x-fb-lsd'})
-            if meta_lsd:
-                lsd = meta_lsd['content']
-            else:
-                script_tag = soup.find('script', text=re.compile(r'"lsd":'))
-                if script_tag:
-                    match_lsd = re.search(r'"lsd":"([^"]+)"', script_tag.string)
-                    if match_lsd:
-                        lsd = match_lsd.group(1)
-            
-            if not lsd:
-                raise Exception("Could not extract LSD token")
-
-            # Step B: Send GraphQL request with dynamic LSD and updated doc_id
-            gql_url = "https://www.threads.net/api/graphql"
-            gql_headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-                "X-IG-App-ID": "238260118697367",
-                "Content-Type": "application/x-www-form-urlencoded",
-                "x-fb-lsd": lsd
-            }
-            payload = {
-                "lsd": lsd,
-                "variables": json.dumps({"postID": code}),
-                "doc_id": "5587632691339264" # Updated doc_id
-            }
-            res = session.post(gql_url, data=payload, headers=gql_headers, timeout=8)
-            
+            target_page = f"https://www.threads.net/t/{code}"
+            res = requests.get(target_page, headers=mobile_headers, timeout=8)
             if res.status_code == 200:
-                data = res.json()
-                edges = data.get('data', {}).get('data', {}).get('edges', [])
-                for edge in edges:
-                    node = edge.get('node', {}).get('thread_items', [{}])[0].get('post', {})
-                    carousel = node.get('carousel_media')
-                    if carousel:
-                        for item in carousel:
-                            candidates = item.get('image_versions2', {}).get('candidates', [])
-                            if candidates:
-                                img_urls.append(candidates[0]['url'])
-                    else:
-                        candidates = node.get('image_versions2', {}).get('candidates', [])
-                        if candidates:
-                            img_urls.append(candidates[0]['url'])
+                soup = BeautifulSoup(res.text, 'html.parser')
+                meta_tags = soup.find_all('meta', property='og:image')
+                for tag in meta_tags:
+                    content = tag.get('content')
+                    if content and content not in img_urls:
+                        img_urls.append(content)
         except Exception as e:
-            logging.error(f"GraphQL method error: {e}")
+            logging.error(f"Meta tag fallback error: {e}")
 
-    # Download Image Bytes (Parallel downloads for speed)
-    def download_img(url):
+    # 3. Download image content bytes
+    image_bytes_list = []
+    headers = {"User-Agent": "Mozilla/5.0"}
+    for url in img_urls:
         try:
-            r = requests.get(url, headers=headers, timeout=10)
+            r = requests.get(url, headers=headers, timeout=8)
             if r.status_code == 200 and len(r.content) > 10000:
-                return r.content
+                image_bytes_list.append(r.content)
         except Exception as err:
             logging.error(f"Download fail: {err}")
-        return None
-
-    if img_urls:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-            results = executor.map(download_img, img_urls)
-            image_bytes_list = [img for img in results if img]
 
     return image_bytes_list
 
-# --- KEYBOARD MENU ---
+# --- KEYBOARD MENU (ALL 9 BUTTONS) ---
 def get_main_keyboard():
     markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     btn1 = types.KeyboardButton("📸 Photos to PDF")
@@ -237,7 +189,6 @@ def get_main_keyboard():
     markup.add(btn1, btn2, btn3, btn4, btn5, btn6, btn7, btn8, btn9)
     return markup
 
-# --- MESSAGE HANDLERS ---
 @bot.message_handler(commands=['start', 'help'])
 @bot.message_handler(func=lambda msg: msg.text in ["🔄 Home / Restart", "🔄 Reset / Clear Session"])
 def send_welcome(message):
@@ -248,6 +199,7 @@ def send_welcome(message):
     )
     bot.send_message(message.chat.id, welcome_text, reply_markup=get_main_keyboard())
 
+# --- BUTTON HANDLERS ---
 @bot.message_handler(func=lambda msg: msg.text == "📸 Photos to PDF")
 def photos_to_pdf_start(message):
     session = get_user_session(message.chat.id)
@@ -305,6 +257,7 @@ def extract_text_start(message):
     session['state'] = 'EXTRACT_TEXT'
     bot.send_message(message.chat.id, "📝 <b>Extract Text Mode:</b>\n\nSend me your PDF file.")
 
+# --- PHOTO HANDLER ---
 @bot.message_handler(content_types=['photo'])
 def receive_image(message):
     session = get_user_session(message.chat.id)
@@ -324,6 +277,7 @@ def receive_image(message):
     except Exception as e:
         logging.error(f"Error: {e}")
 
+# --- DOCUMENT HANDLER ---
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
     session = get_user_session(message.chat.id)
@@ -354,13 +308,16 @@ def handle_document(message):
         types.InlineKeyboardButton("📝 Extract Text", callback_data="act_extract_text"),
         types.InlineKeyboardButton("📑 Add to Merge Queue", callback_data="act_add_to_merge")
     )
+
     bot.reply_to(message, f"📄 <b>File Received:</b> <code>{doc.file_name}</code>", reply_markup=markup)
 
+# --- ACTION CALLBACK HANDLERS ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("act_"))
 def handle_action_choice(call):
     session = get_user_session(call.message.chat.id)
     chat_id = call.message.chat.id
     action = call.data.replace("act_", "")
+
     pdf_bytes = session.get('active_pdf_bytes')
 
     if action == "compress":
@@ -408,12 +365,14 @@ def handle_action_choice(call):
         session['pdfs'].append(pdf_bytes)
         bot.send_message(chat_id, f"📑 Added to Merge queue! ({len(session['pdfs'])} total). Send another or tap Merge.")
 
+# --- TEXT & THREADS LINK INPUTS ---
 @bot.message_handler(func=lambda msg: True)
 def handle_text_inputs(message):
     session = get_user_session(message.chat.id)
     chat_id = message.chat.id
     text = message.text.strip()
 
+    # Matches threads.com and threads.net URLs
     threads_match = re.search(r'https?://(?:www\.)?threads\.(?:net|com)/[^\s]+', text)
     
     if threads_match or session['state'] == 'WAIT_THREADS_LINK':
@@ -491,6 +450,7 @@ def handle_text_inputs(message):
         finally:
             reset_user_session(chat_id)
 
+# --- CALLBACK ROUTER ---
 @bot.callback_query_handler(func=lambda call: call.data in ["build_image_pdf", "clear_images"])
 def handle_callbacks(call):
     session = get_user_session(call.message.chat.id)
