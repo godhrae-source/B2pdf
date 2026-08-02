@@ -16,10 +16,11 @@ def run_dummy_server():
 
 threading.Thread(target=run_dummy_server, daemon=True).start()
 
-# 2. HEAVY IMPORTS (Loaded after server starts)
+# 2. IMPORTS
 import io
 import re
 import time
+import json
 import logging
 import requests
 from bs4 import BeautifulSoup
@@ -63,18 +64,6 @@ def reset_user_session(chat_id):
             "active_pdf_name": "document.pdf"
         }
 
-def enhance_newspaper_image(pil_img):
-    gray = pil_img.convert('L')
-    enhancer = ImageEnhance.Contrast(gray)
-    contrasted = enhancer.enhance(1.8)
-    sharp_enhancer = ImageEnhance.Sharpness(contrasted)
-    sharpened = sharp_enhancer.enhance(2.0)
-    return sharpened.convert('RGB')
-
-def create_a4_canvas():
-    return Image.new('RGB', (A4_WIDTH, A4_HEIGHT), (255, 255, 255))
-
-# RAM-OPTIMIZED PDF PROCESSOR
 def process_images_to_pdf(image_bytes_list, layout_mode="1_per_page"):
     pdf_pages = []
     
@@ -84,16 +73,9 @@ def process_images_to_pdf(image_bytes_list, layout_mode="1_per_page"):
             if img.mode != 'RGB':
                 img = img.convert('RGB')
             
-            # Downscale large image resolution to prevent status 137 memory limits
             img.thumbnail((A4_WIDTH, A4_HEIGHT), Image.Resampling.LANCZOS)
-
-            if layout_mode == "newspaper":
-                enhanced = enhance_newspaper_image(img)
-                filled_img = ImageOps.fit(enhanced, (A4_WIDTH, A4_HEIGHT), Image.Resampling.LANCZOS)
-                pdf_pages.append(filled_img)
-            else:
-                filled_img = ImageOps.fit(img, (A4_WIDTH, A4_HEIGHT), Image.Resampling.LANCZOS)
-                pdf_pages.append(filled_img)
+            filled_img = ImageOps.fit(img, (A4_WIDTH, A4_HEIGHT), Image.Resampling.LANCZOS)
+            pdf_pages.append(filled_img)
         except Exception as e:
             logging.error(f"Error processing image: {e}")
 
@@ -112,91 +94,100 @@ def process_images_to_pdf(image_bytes_list, layout_mode="1_per_page"):
         return output_buffer
     return None
 
+# --- BULLETPROOF THREADS SCRAPER ---
 def extract_images_from_threads(threads_url):
+    # Standardize Threads URL
+    threads_url = threads_url.split('?')[0] # Remove tracking query parameters
+    if not threads_url.endswith('/'):
+        threads_url += '/'
+
     headers = {
-        "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-User": "?1",
+        "Sec-Fetch-Dest": "document"
     }
     
+    img_urls = []
+
     try:
+        # Method 1: Direct Page HTML & JSON Data Parsing
         response = requests.get(threads_url, headers=headers, timeout=12)
-        if response.status_code != 200:
-            return []
-
-        html_content = response.text
-        img_urls = []
-
-        raw_urls = re.findall(r'https://scontent[^\s"\'\\]+', html_content)
-        if not raw_urls:
-            raw_urls = re.findall(r'https://[^\s"\'\\]*fbcdn[^\s"\'\\]+', html_content)
-
-        for u in raw_urls:
-            clean_url = u.replace('\\/', '/').replace('\\u0026', '&')
-            if any(x in clean_url for x in ['_s.jpg', '_a.jpg', 'p150x150', 'p50x50', '150x150', '50x50']):
-                continue
-            if clean_url not in img_urls:
-                img_urls.append(clean_url)
-
-        if not img_urls:
+        if response.status_code == 200:
+            html_content = response.text
+            
+            # Search Meta tags
             soup = BeautifulSoup(html_content, 'html.parser')
-            for tag in soup.find_all('meta', property='og:image'):
+            for tag in soup.find_all('meta', property=['og:image', 'twitter:image']):
                 content = tag.get('content')
-                if content and content not in img_urls:
+                if content and 'scontent' in content and content not in img_urls:
                     img_urls.append(content)
 
-        # Cap max downloaded photos to 30 to prevent 512MB RAM overflow
-        img_urls = img_urls[:30]
+            # Search raw JSON embedded in script tags
+            script_matches = re.findall(r'<script type="application/json"[^>]*>(.*?)</script>', html_content, re.DOTALL)
+            for script in script_matches:
+                if 'image_versions2' in script or 'candidates' in script:
+                    raw_links = re.findall(r'https://scontent[^\s"\'\\]+', script)
+                    for link in raw_links:
+                        clean = link.replace('\\/', '/').replace('\\u0026', '&')
+                        if clean not in img_urls and not any(p in clean for p in ['_s.jpg', 'p150x150', '50x50']):
+                            img_urls.append(clean)
 
+        # Method 2: OEmbed Fallback if Method 1 missed carousel images
+        if not img_urls:
+            oembed_url = f"https://www.threads.net/oembed?url={threads_url}"
+            o_resp = requests.get(oembed_url, headers=headers, timeout=8)
+            if o_resp.status_code == 200:
+                data = o_resp.json()
+                if 'thumbnail_url' in data:
+                    img_urls.append(data['thumbnail_url'])
+
+        # Limit to unique high-res URLs
+        clean_urls = []
+        for u in img_urls:
+            u_clean = u.replace('\\/', '/').replace('\\u0026', '&')
+            if u_clean not in clean_urls:
+                clean_urls.append(u_clean)
+
+        clean_urls = clean_urls[:20] # Cap to max 20 images to protect RAM
+        logging.info(f"Extracted {len(clean_urls)} clean image URLs.")
+
+        # Download image bytes
         image_bytes_list = []
-        dl_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        }
-
-        for img_url in img_urls:
+        for url in clean_urls:
             try:
-                img_resp = requests.get(img_url, headers=dl_headers, timeout=10)
-                if img_resp.status_code == 200 and len(img_resp.content) > 15000:
-                    image_bytes_list.append(img_resp.content)
+                res = requests.get(url, headers={"User-Agent": headers["User-Agent"]}, timeout=10)
+                if res.status_code == 200 and len(res.content) > 10000:
+                    image_bytes_list.append(res.content)
             except Exception as err:
-                logging.error(f"Error downloading image: {err}")
+                logging.error(f"Image download error: {err}")
 
         return image_bytes_list
 
     except Exception as e:
-        logging.error(f"Threads extraction exception: {e}")
+        logging.error(f"Threads extraction failed: {e}")
         return []
 
 def get_main_keyboard():
     markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     btn1 = types.KeyboardButton("📸 Photos to PDF")
-    btn2 = types.KeyboardButton("📰 Newspaper HD Scanner")
-    btn3 = types.KeyboardButton("🧵 Threads to PDF")
-    btn4 = types.KeyboardButton("📑 Merge PDFs")
-    btn5 = types.KeyboardButton("✂️ Delete PDF Pages")
-    btn6 = types.KeyboardButton("🗜️ Compress PDF")
-    btn7 = types.KeyboardButton("🔒 Protect / Unlock PDF")
-    btn8 = types.KeyboardButton("📝 Extract Text")
-    btn9 = types.KeyboardButton("🔄 Home / Restart")
-    markup.add(btn1, btn2, btn3, btn4, btn5, btn6, btn7, btn8, btn9)
+    btn2 = types.KeyboardButton("🧵 Threads to PDF")
+    btn3 = types.KeyboardButton("🔄 Home / Restart")
+    markup.add(btn1, btn2, btn3)
     return markup
 
 @bot.message_handler(commands=['start', 'help'])
-@bot.message_handler(func=lambda msg: msg.text in ["🔄 Home / Restart", "🔄 Reset / Clear Session"])
+@bot.message_handler(func=lambda msg: msg.text in ["🔄 Home / Restart"])
 def send_welcome(message):
     reset_user_session(message.chat.id)
-    welcome_text = (
-        "<b>✨ Welcome to your PDF Organizer Bot!</b>\n\n"
-        "Select an option below, send a file, or paste a <b>Threads post link</b> to start:"
+    bot.send_message(
+        message.chat.id,
+        "✨ <b>Welcome! Send a Threads link or photo to start:</b>",
+        reply_markup=get_main_keyboard()
     )
-    bot.send_message(message.chat.id, welcome_text, reply_markup=get_main_keyboard())
-
-@bot.message_handler(func=lambda msg: msg.text == "📸 Photos to PDF")
-def photos_to_pdf_start(message):
-    session = get_user_session(message.chat.id)
-    reset_user_session(message.chat.id)
-    session['state'] = 'COLLECTING_IMAGES'
-    bot.send_message(message.chat.id, "📸 Send me your photos now!")
 
 @bot.message_handler(func=lambda msg: msg.text == "🧵 Threads to PDF")
 def threads_start(message):
@@ -204,22 +195,6 @@ def threads_start(message):
     session = get_user_session(message.chat.id)
     session['state'] = 'WAIT_THREADS_LINK'
     bot.send_message(message.chat.id, "🧵 Paste any Threads post URL below:")
-
-@bot.message_handler(content_types=['photo'])
-def receive_image(message):
-    session = get_user_session(message.chat.id)
-    session['state'] = 'COLLECTING_IMAGES'
-    try:
-        file_id = message.photo[-1].file_id
-        file_info = bot.get_file(file_id)
-        downloaded_file = bot.download_file(file_info.file_path)
-        session['images'].append(downloaded_file)
-        
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton(f"⚙️ Generate PDF ({len(session['images'])} Photos)", callback_data="build_image_pdf"))
-        bot.reply_to(message, f"✅ Photo #{len(session['images'])} received!", reply_markup=markup)
-    except Exception as e:
-        logging.error(f"Error: {e}")
 
 @bot.message_handler(func=lambda msg: True)
 def handle_text_inputs(message):
@@ -231,34 +206,27 @@ def handle_text_inputs(message):
     
     if threads_match or session['state'] == 'WAIT_THREADS_LINK':
         url = threads_match.group(0) if threads_match else text
-        bot.send_message(chat_id, "🔍 <i>Fetching photos from post...</i>")
+        bot.send_message(chat_id, "🔍 <i>Extracting images from Threads...</i>")
         try:
             images = extract_images_from_threads(url)
             if not images:
-                bot.send_message(chat_id, "❌ Could not find images in that post.")
+                bot.send_message(
+                    chat_id, 
+                    "❌ <b>Could not find images in this post.</b>\n\n"
+                    "• The post might be a text-only post or video.\n"
+                    "• The post might be from a private account."
+                )
                 return
 
-            bot.send_message(chat_id, f"✅ Found {len(images)} images! Generating PDF...")
-            pdf_buffer = process_images_to_pdf(images, layout_mode="1_per_page")
+            bot.send_message(chat_id, f"✅ Found {len(images)} image(s)! Building PDF...")
+            pdf_buffer = process_images_to_pdf(images)
 
             if pdf_buffer:
-                bot.send_document(chat_id, ("threads_post.pdf", pdf_buffer.getvalue()), caption="✅ PDF Ready!")
+                bot.send_document(chat_id, ("threads_post.pdf", pdf_buffer.getvalue()), caption="✅ Threads PDF Ready!")
         except Exception as e:
             bot.send_message(chat_id, f"❌ Failed: {e}")
         finally:
             reset_user_session(chat_id)
-
-@bot.callback_query_handler(func=lambda call: call.data == "build_image_pdf")
-def handle_callbacks(call):
-    session = get_user_session(call.message.chat.id)
-    chat_id = call.message.chat.id
-
-    if session['images']:
-        bot.send_message(chat_id, "⏳ Building PDF...")
-        pdf_buffer = process_images_to_pdf(session['images'])
-        if pdf_buffer:
-            bot.send_document(chat_id, ("document.pdf", pdf_buffer.getvalue()), caption="✅ Here is your PDF!")
-        reset_user_session(chat_id)
 
 if __name__ == "__main__":
     logging.info("Bot started...")
