@@ -2,7 +2,7 @@ import os
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# 1. IMMEDIATE WEBSERVER START (Prevents Render Free Plan Timeout)
+# 1. IMMEDIATE WEBSERVER START (Prevents Render Free Plan Port Scan Timeout)
 class DummyServer(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -109,65 +109,90 @@ def process_images_to_pdf(image_bytes_list, layout_mode="1_per_page"):
         return output_buffer
     return None
 
-# --- ENHANCED THREADS SCRAPER ---
+# --- RECURSIVE JSON PARSER FOR CAROUSEL SLIDES ---
+def extract_all_carousel_urls(obj, found_urls):
+    if isinstance(obj, dict):
+        # Look for image candidates inside Threads GraphQL / HTML structure
+        if "candidates" in obj and isinstance(obj["candidates"], list):
+            # Take highest quality image candidate
+            if len(obj["candidates"]) > 0 and "url" in obj["candidates"][0]:
+                found_urls.append(obj["candidates"][0]["url"])
+        elif "image_versions2" in obj and isinstance(obj["image_versions2"], dict):
+            candidates = obj["image_versions2"].get("candidates", [])
+            if candidates and "url" in candidates[0]:
+                found_urls.append(candidates[0]["url"])
+        
+        for k, v in obj.items():
+            extract_all_carousel_urls(v, found_urls)
+    elif isinstance(obj, list):
+        for item in obj:
+            extract_all_carousel_urls(item, found_urls)
+
+# --- ADVANCED THREADS CAROUSEL SCRAPER ---
 def extract_images_from_threads(threads_url):
-    # Extract post ID / shortcode
     post_code_match = re.search(r'/(?:post|t)/([A-Za-z0-9_-]+)', threads_url)
     post_code = post_code_match.group(1) if post_code_match else None
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Mode": "navigate"
     }
     
     img_urls = []
 
-    # Strategy 1: Fetch through mobile browser session
+    # 1. Fetch full page source
     try:
         clean_url = f"https://www.threads.net/t/{post_code}/" if post_code else threads_url
-        response = requests.get(clean_url, headers=headers, timeout=10)
+        response = requests.get(clean_url, headers=headers, timeout=12)
         if response.status_code == 200:
             html = response.text
             
-            # Match raw scontent links in JSON
-            matches = re.findall(r'https://scontent[^\s"\'\\]+', html)
-            for m in matches:
-                m_clean = m.replace('\\/', '/').replace('\\u0026', '&')
-                if not any(x in m_clean for x in ['_s.jpg', '_a.jpg', 'p150x150', '50x50', 's150x150']):
-                    if m_clean not in img_urls:
-                        img_urls.append(m_clean)
+            # Extract raw embedded JSON blobs
+            json_blobs = re.findall(r'<script type="application/json"[^>]*>(.*?)</script>', html, re.DOTALL)
+            for blob in json_blobs:
+                if 'image_versions2' in blob or 'carousel_media' in blob or 'candidates' in blob:
+                    try:
+                        data = json.loads(blob)
+                        extract_all_carousel_urls(data, img_urls)
+                    except Exception:
+                        pass
 
-            # OpenGraph tags check
-            soup = BeautifulSoup(html, 'html.parser')
-            for tag in soup.find_all('meta', property=['og:image', 'twitter:image']):
-                c = tag.get('content')
-                if c and c not in img_urls:
-                    img_urls.append(c)
+            # Fallback regex search for multi-slide images inside page memory
+            if not img_urls:
+                raw_matches = re.findall(r'https://scontent[^\s"\'\\]+', html)
+                for m in raw_matches:
+                    m_clean = m.replace('\\/', '/').replace('\\u0026', '&')
+                    if not any(x in m_clean for x in ['_s.jpg', '_a.jpg', 'p150x150', '50x50', 's150x150', 'e15']):
+                        if m_clean not in img_urls:
+                            img_urls.append(m_clean)
+
+            # Og tag fallback if no carousel slides found
+            if not img_urls:
+                soup = BeautifulSoup(html, 'html.parser')
+                for tag in soup.find_all('meta', property=['og:image', 'twitter:image']):
+                    c = tag.get('content')
+                    if c and c not in img_urls:
+                        img_urls.append(c)
+
     except Exception as e:
-        logging.error(f"Strategy 1 failed: {e}")
+        logging.error(f"Carousel Extraction Error: {e}")
 
-    # Strategy 2: OEmbed API fallback
-    if not img_urls and post_code:
-        try:
-            oembed_api = f"https://www.threads.net/oembed?url=https://www.threads.net/t/{post_code}"
-            res = requests.get(oembed_api, headers=headers, timeout=8)
-            if res.status_code == 200:
-                data = res.json()
-                if 'thumbnail_url' in data:
-                    img_urls.append(data['thumbnail_url'])
-        except Exception as e:
-            logging.error(f"Strategy 2 failed: {e}")
+    # Remove duplicates while keeping order
+    unique_urls = []
+    for u in img_urls:
+        u_clean = u.replace('\\/', '/').replace('\\u0026', '&')
+        if u_clean not in unique_urls:
+            unique_urls.append(u_clean)
 
-    logging.info(f"Extracted {len(img_urls)} unique image URLs.")
+    logging.info(f"Found {len(unique_urls)} slide images for PDF.")
 
-    # Download image bytes
+    # Download unique slides
     image_bytes_list = []
     dl_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     
-    for url in img_urls[:25]:
+    for url in unique_urls[:30]: # Up to 30 pages max per PDF
         try:
             r = requests.get(url, headers=dl_headers, timeout=10)
             if r.status_code == 200 and len(r.content) > 12000:
@@ -379,26 +404,26 @@ def handle_text_inputs(message):
     
     if threads_match or session['state'] == 'WAIT_THREADS_LINK':
         url = threads_match.group(0) if threads_match else text
-        bot.send_message(chat_id, "🔍 <i>Fetching post images...</i>")
+        bot.send_message(chat_id, "🔍 <i>Extracting all pages/slides from post...</i>")
         try:
             images = extract_images_from_threads(url)
             if not images:
                 bot.send_message(
                     chat_id, 
                     "❌ <b>Could not extract images from this post.</b>\n\n"
-                    "• Make sure the post contains static images (not videos or text-only).\n"
-                    "• Make sure the Threads profile is public."
+                    "• Ensure the post contains images/slides.\n"
+                    "• Ensure the user account is public."
                 )
                 return
 
-            bot.send_message(chat_id, f"✅ Found {len(images)} image(s)! Creating PDF...")
+            bot.send_message(chat_id, f"✅ Found {len(images)} slide(s)! Creating PDF document...")
             pdf_buffer = process_images_to_pdf(images, layout_mode="1_per_page")
 
             if pdf_buffer:
                 bot.send_document(
                     chat_id, 
-                    ("threads_post.pdf", pdf_buffer.getvalue()), 
-                    caption=f"✅ <b>Threads PDF Ready!</b>\nIncluded {len(images)} images."
+                    ("threads_carousel.pdf", pdf_buffer.getvalue()), 
+                    caption=f"✅ <b>Threads PDF Ready!</b>\nConverted all {len(images)} pages."
                 )
         except Exception as e:
             bot.send_message(chat_id, f"❌ Failed: {e}")
