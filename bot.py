@@ -132,8 +132,8 @@ def process_images_to_pdf(image_bytes_list, layout_mode="1_per_page"):
         return output_buffer
     return None
 
-# --- ADVANCED THREADS MULTI-IMAGE CAROUSEL EXTRACTOR ---
-def extract_images_from_threads(url):
+# --- ADVANCED THREADS & INSTAGRAM CAROUSEL IMAGE EXTRACTOR ---
+def extract_images_from_social_link(url):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
@@ -146,13 +146,13 @@ def extract_images_from_threads(url):
     try:
         response = requests.get(url, headers=headers, timeout=15)
         if response.status_code != 200:
-            logging.error(f"Threads request failed status: {response.status_code}")
+            logging.error(f"Social link request failed status: {response.status_code}")
             return []
 
         html_content = response.text
         img_urls = []
 
-        # Find all high-res CDN image links in embedded JSON payload
+        # Find all high-res CDN image links in embedded script/JSON payload
         raw_urls = re.findall(r'https://scontent[^\s"\'\\]+', html_content)
         if not raw_urls:
             raw_urls = re.findall(r'https://[^\s"\'\\]*fbcdn[^\s"\'\\]+', html_content)
@@ -176,7 +176,7 @@ def extract_images_from_threads(url):
                 if content and content not in img_urls:
                     img_urls.append(content)
 
-        logging.info(f"Extracted {len(img_urls)} unique image URLs from Threads.")
+        logging.info(f"Extracted {len(img_urls)} unique image URLs from link.")
 
         image_bytes_list = []
         dl_headers = {
@@ -195,7 +195,7 @@ def extract_images_from_threads(url):
         return image_bytes_list
 
     except Exception as e:
-        logging.error(f"Threads extraction exception: {e}")
+        logging.error(f"Social extraction exception: {e}")
         return []
 
 # --- MAIN KEYBOARD ---
@@ -203,7 +203,7 @@ def get_main_keyboard():
     markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     btn1 = types.KeyboardButton("📸 Photos to PDF")
     btn2 = types.KeyboardButton("📰 Newspaper HD Scanner")
-    btn3 = types.KeyboardButton("🧵 Threads to PDF")
+    btn3 = types.KeyboardButton("🧵 Threads / IG to PDF")
     btn4 = types.KeyboardButton("📑 Merge PDFs")
     btn5 = types.KeyboardButton("✂️ Delete PDF Pages")
     btn6 = types.KeyboardButton("🗜️ Compress PDF")
@@ -219,7 +219,7 @@ def send_welcome(message):
     reset_user_session(message.chat.id)
     welcome_text = (
         "<b>✨ Welcome to your PDF Organizer Bot!</b>\n\n"
-        "Select an option below, send a file, or paste a <b>Threads post link</b> to start:"
+        "Select an option below, send a file, or paste a <b>Threads/Instagram post link</b> to start:"
     )
     bot.send_message(message.chat.id, welcome_text, reply_markup=get_main_keyboard())
 
@@ -251,14 +251,14 @@ def newspaper_start(message):
     session['layout_mode'] = 'newspaper'
     bot.send_message(message.chat.id, "📰 <b>Newspaper HD Scanner Active!</b>\n\nSend your screenshot or photo clip now.")
 
-@bot.message_handler(func=lambda msg: msg.text == "🧵 Threads to PDF")
+@bot.message_handler(func=lambda msg: msg.text == "🧵 Threads / IG to PDF")
 def threads_start(message):
     reset_user_session(message.chat.id)
     session = get_user_session(message.chat.id)
     session['state'] = 'WAIT_THREADS_LINK'
     bot.send_message(
         message.chat.id,
-        "🧵 <b>Threads Post to PDF:</b>\n\nPlease send/paste the Threads post URL.\n\n<i>Example:</i> <code>https://www.threads.net/@user/post/C123456789</code>"
+        "🧵📸 <b>Threads / Instagram Post to PDF:</b>\n\nPlease paste any Threads or Instagram post URL.\n\n<i>Example:</i>\n<code>https://www.threads.net/@user/post/123</code>\n<code>https://www.instagram.com/p/123/</code>"
     )
 
 @bot.message_handler(func=lambda msg: msg.text == "📑 Merge PDFs")
@@ -438,27 +438,28 @@ def handle_action_choice(call):
         session['pdfs'].append(pdf_bytes)
         bot.send_message(chat_id, f"📑 Added to Merge queue! ({len(session['pdfs'])} total). Send another PDF or tap 'Merge PDFs' in main menu.")
 
-# --- TEXT RESPONSES & THREADS LINKS ---
+# --- TEXT RESPONSES & THREADS/INSTAGRAM LINKS ---
 @bot.message_handler(func=lambda msg: True)
 def handle_text_inputs(message):
     session = get_user_session(message.chat.id)
     chat_id = message.chat.id
     text = message.text.strip()
 
-    threads_match = re.search(r'https?://(?:www\.)?threads\.(?:net|com)/[^\s]+', text)
+    # Detect either Threads or Instagram links automatically
+    social_match = re.search(r'https?://(?:www\.)?(?:threads\.(?:net|com)|instagram\.com)/[^\s]+', text)
     
-    if threads_match or session['state'] == 'WAIT_THREADS_LINK':
-        url = threads_match.group(0) if threads_match else text
+    if social_match or session['state'] == 'WAIT_THREADS_LINK':
+        url = social_match.group(0) if social_match else text
         if not url.startswith("http"):
-            bot.send_message(chat_id, "❌ Invalid URL format. Send a valid Threads post link.")
+            bot.send_message(chat_id, "❌ Invalid URL format. Send a valid Threads or Instagram post link.")
             return
 
-        bot.send_message(chat_id, "🔍 <i>Fetching all photos from Threads post... Please wait.</i>")
+        bot.send_message(chat_id, "🔍 <i>Fetching photos from post... Please wait.</i>")
         
         try:
-            images = extract_images_from_threads(url)
+            images = extract_images_from_social_link(url)
             if not images:
-                bot.send_message(chat_id, "❌ Could not find any images in that Threads post or the link is private/invalid.")
+                bot.send_message(chat_id, "❌ Could not find any images in that post or the account is private.")
                 return
 
             bot.send_message(chat_id, f"✅ Found {len(images)} image(s)! Converting to PDF...")
@@ -467,14 +468,14 @@ def handle_text_inputs(message):
             if pdf_buffer:
                 bot.send_document(
                     chat_id,
-                    ("threads_post.pdf", pdf_buffer.getvalue()),
-                    caption=f"✅ <b>Threads Post PDF Ready!</b>\n\nDownloaded all {len(images)} images."
+                    ("social_post.pdf", pdf_buffer.getvalue()),
+                    caption=f"✅ <b>Post PDF Ready!</b>\n\nDownloaded all {len(images)} images."
                 )
             else:
                 bot.send_message(chat_id, "❌ Error generating PDF from post images.")
 
         except Exception as e:
-            bot.send_message(chat_id, f"❌ Failed to process Threads post: {e}")
+            bot.send_message(chat_id, f"❌ Failed to process link: {e}")
         finally:
             reset_user_session(chat_id)
 
