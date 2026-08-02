@@ -3,14 +3,12 @@ import io
 import re
 import time
 import logging
-import threading
 import requests
 from bs4 import BeautifulSoup
 from PIL import Image, ImageEnhance, ImageOps
 from pypdf import PdfReader, PdfWriter
 import telebot
 from telebot import types
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -24,21 +22,6 @@ user_data = {}
 
 A4_WIDTH = 1240
 A4_HEIGHT = 1754
-
-# --- DUMMY SERVER TO SATISFY RENDER FREE PLAN PORT SCAN ---
-class DummyServer(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is live and running!")
-
-def run_dummy_server():
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(('0.0.0.0', port), DummyServer)
-    server.serve_forever()
-
-# Start dummy HTTP server in background thread so Render Free Web Service doesn't time out
-threading.Thread(target=run_dummy_server, daemon=True).start()
 
 def get_user_session(chat_id):
     if chat_id not in user_data:
@@ -149,36 +132,43 @@ def process_images_to_pdf(image_bytes_list, layout_mode="1_per_page"):
         return output_buffer
     return None
 
-# --- WORKING THREADS SCRAPER ---
-def extract_images_from_threads(threads_url):
+# --- ADVANCED THREADS MULTI-IMAGE CAROUSEL EXTRACTOR ---
+def extract_images_from_threads(url):
     headers = {
-        "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "cross-site",
     }
     
     try:
-        response = requests.get(threads_url, headers=headers, timeout=12)
+        response = requests.get(url, headers=headers, timeout=15)
         if response.status_code != 200:
-            logging.error(f"Threads request failed with status: {response.status_code}")
+            logging.error(f"Threads request failed status: {response.status_code}")
             return []
 
         html_content = response.text
         img_urls = []
 
+        # Find all high-res CDN image links in embedded JSON payload
         raw_urls = re.findall(r'https://scontent[^\s"\'\\]+', html_content)
         if not raw_urls:
             raw_urls = re.findall(r'https://[^\s"\'\\]*fbcdn[^\s"\'\\]+', html_content)
 
         for u in raw_urls:
+            # Clean up escaped JSON string formatting
             clean_url = u.replace('\\/', '/').replace('\\u0026', '&')
             
+            # Filter out profile pictures, low-res thumbnails, and duplicate entries
             if any(x in clean_url for x in ['_s.jpg', '_a.jpg', 'p150x150', 'p50x50', '150x150', '50x50']):
                 continue
             
             if clean_url not in img_urls:
                 img_urls.append(clean_url)
 
+        # Fallback to meta tags if JSON parsing returns nothing
         if not img_urls:
             soup = BeautifulSoup(html_content, 'html.parser')
             for tag in soup.find_all('meta', property='og:image'):
@@ -186,7 +176,7 @@ def extract_images_from_threads(threads_url):
                 if content and content not in img_urls:
                     img_urls.append(content)
 
-        logging.info(f"Extracted {len(img_urls)} unique image URLs.")
+        logging.info(f"Extracted {len(img_urls)} unique image URLs from Threads.")
 
         image_bytes_list = []
         dl_headers = {
@@ -196,10 +186,11 @@ def extract_images_from_threads(threads_url):
         for img_url in img_urls:
             try:
                 img_resp = requests.get(img_url, headers=dl_headers, timeout=10)
+                # Keep original high-res photos (>15KB)
                 if img_resp.status_code == 200 and len(img_resp.content) > 15000:
                     image_bytes_list.append(img_resp.content)
             except Exception as err:
-                logging.error(f"Error downloading image: {err}")
+                logging.error(f"Error downloading image {img_url}: {err}")
 
         return image_bytes_list
 
@@ -267,7 +258,7 @@ def threads_start(message):
     session['state'] = 'WAIT_THREADS_LINK'
     bot.send_message(
         message.chat.id,
-        "🧵 <b>Threads Post to PDF:</b>\n\nPlease paste any Threads post URL.\n\n<i>Example:</i>\n<code>https://www.threads.net/@user/post/123</code>"
+        "🧵 <b>Threads Post to PDF:</b>\n\nPlease send/paste the Threads post URL.\n\n<i>Example:</i> <code>https://www.threads.net/@user/post/C123456789</code>"
     )
 
 @bot.message_handler(func=lambda msg: msg.text == "📑 Merge PDFs")
@@ -333,10 +324,11 @@ def receive_image(message):
     except Exception as e:
         logging.error(f"Error downloading photo: {e}")
 
-# --- DOCUMENT HANDLER ---
+# --- PDF DOCUMENT HANDLER ---
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
     session = get_user_session(message.chat.id)
+    chat_id = message.chat.id
     doc = message.document
     
     if doc.mime_type and doc.mime_type.startswith("image/"):
@@ -376,7 +368,7 @@ def handle_document(message):
         reply_markup=markup
     )
 
-# --- ACTION CALLBACKS ---
+# --- ACTION MENU CALLBACKS FOR SENT PDFS ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("act_"))
 def handle_action_choice(call):
     session = get_user_session(call.message.chat.id)
@@ -446,7 +438,7 @@ def handle_action_choice(call):
         session['pdfs'].append(pdf_bytes)
         bot.send_message(chat_id, f"📑 Added to Merge queue! ({len(session['pdfs'])} total). Send another PDF or tap 'Merge PDFs' in main menu.")
 
-# --- TEXT RESPONSES & THREADS LINK HANDLING ---
+# --- TEXT RESPONSES & THREADS LINKS ---
 @bot.message_handler(func=lambda msg: True)
 def handle_text_inputs(message):
     session = get_user_session(message.chat.id)
@@ -461,12 +453,12 @@ def handle_text_inputs(message):
             bot.send_message(chat_id, "❌ Invalid URL format. Send a valid Threads post link.")
             return
 
-        bot.send_message(chat_id, "🔍 <i>Fetching photos from post... Please wait.</i>")
+        bot.send_message(chat_id, "🔍 <i>Fetching all photos from Threads post... Please wait.</i>")
         
         try:
             images = extract_images_from_threads(url)
             if not images:
-                bot.send_message(chat_id, "❌ Could not find any images in that post or the account is private.")
+                bot.send_message(chat_id, "❌ Could not find any images in that Threads post or the link is private/invalid.")
                 return
 
             bot.send_message(chat_id, f"✅ Found {len(images)} image(s)! Converting to PDF...")
@@ -482,7 +474,7 @@ def handle_text_inputs(message):
                 bot.send_message(chat_id, "❌ Error generating PDF from post images.")
 
         except Exception as e:
-            bot.send_message(chat_id, f"❌ Failed to process link: {e}")
+            bot.send_message(chat_id, f"❌ Failed to process Threads post: {e}")
         finally:
             reset_user_session(chat_id)
 
@@ -547,7 +539,7 @@ def handle_text_inputs(message):
         finally:
             reset_user_session(chat_id)
 
-# --- CALLBACK QUERY HANDLERS ---
+# --- CALLBACK BUTTON HANDLERS ---
 @bot.callback_query_handler(func=lambda call: call.data in ["build_image_pdf", "clear_images", "do_merge_pdfs"] or call.data.startswith("set_layout_"))
 def handle_callbacks(call):
     session = get_user_session(call.message.chat.id)
@@ -619,5 +611,5 @@ if __name__ == "__main__":
         try:
             bot.infinity_polling(timeout=20, long_polling_timeout=10, skip_pending=True)
         except Exception as err:
-            logging.error(f"Polling error: {err}")
+            logging.error(f"Polling connection error encountered: {err}")
             time.sleep(3)
