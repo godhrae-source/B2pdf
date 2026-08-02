@@ -108,10 +108,24 @@ def process_images_to_pdf(image_bytes_list, layout_mode="1_per_page"):
         return output_buffer
     return None
 
-# --- MULTI-METHOD THREADS SCRAPER ---
+# --- MULTI-METHOD THREADS SCRAPER (HANDLES /share/ LINKS) ---
 def extract_images_from_threads(threads_url):
-    match = re.search(r'/(?:post|t)/([A-Za-z0-9_-]+)', threads_url)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    }
+
+    # 1. Resolve short /share/ redirects to full URLs
+    try:
+        if "/share/" in threads_url:
+            res = requests.head(threads_url, headers=headers, allow_redirects=True, timeout=8)
+            threads_url = res.url
+    except Exception as e:
+        logging.error(f"Redirect resolution failed: {e}")
+
+    # 2. Extract Post Code
+    match = re.search(r'/(?:post|t|share)/([A-Za-z0-9_-]+)', threads_url)
     if not match:
+        logging.error(f"Could not extract code from URL: {threads_url}")
         return []
     
     code = match.group(1)
@@ -120,23 +134,23 @@ def extract_images_from_threads(threads_url):
     # Method 1: Embed Page Scrape
     try:
         embed_url = f"https://www.threads.net/t/{code}/embed"
-        headers = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15"}
-        res = requests.get(embed_url, headers=headers, timeout=8)
+        embed_headers = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15"}
+        res = requests.get(embed_url, headers=embed_headers, timeout=8)
         if res.status_code == 200:
             found_urls = re.findall(r'https://scontent[^\s"\'<]+', res.text)
             for u in found_urls:
                 clean_u = u.replace('\\u0026', '&').replace('\\/', '/')
-                if not any(x in clean_u for x in ['s150x150', 's320x320', 'p150x150']):
+                if not any(x in clean_u for x in ['s150x150', 's320x320', 'p150x150', '150x150']):
                     if clean_u not in img_urls:
                         img_urls.append(clean_u)
     except Exception as e:
         logging.error(f"Embed method error: {e}")
 
-    # Method 2: Fallback to GraphQL API
+    # Method 2: GraphQL Fallback
     if not img_urls:
         try:
             gql_url = "https://www.threads.net/api/graphql"
-            headers = {
+            gql_headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
                 "X-IG-App-ID": "238260118697367",
                 "Content-Type": "application/x-www-form-urlencoded",
@@ -146,7 +160,7 @@ def extract_images_from_threads(threads_url):
                 "variables": json.dumps({"postID": code}),
                 "doc_id": "5578654128849925"
             }
-            res = requests.post(gql_url, data=payload, headers=headers, timeout=8)
+            res = requests.post(gql_url, data=payload, headers=gql_headers, timeout=8)
             if res.status_code == 200:
                 data = res.json()
                 edges = data.get('data', {}).get('data', {}).get('edges', [])
@@ -167,11 +181,10 @@ def extract_images_from_threads(threads_url):
 
     # Download Image Bytes
     image_bytes_list = []
-    headers = {"User-Agent": "Mozilla/5.0"}
     for url in img_urls:
         try:
             r = requests.get(url, headers=headers, timeout=8)
-            if r.status_code == 200 and len(r.content) > 12000:
+            if r.status_code == 200 and len(r.content) > 10000:
                 image_bytes_list.append(r.content)
         except Exception as err:
             logging.error(f"Download fail: {err}")
