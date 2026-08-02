@@ -62,81 +62,79 @@ def reset_user_session(chat_id):
             "active_pdf_name": "document.pdf"
         }
 
-# --- STEP 1: DIRECT META MEDIA EXTRACTOR (INSTAGRAM & THREADS) ---
+# --- STEP 1: COBALT API MEDIA EXTRACTOR (INSTAGRAM & THREADS) ---
 def fetch_meta_post_images(url):
     """
-    Directly extracts image CDN links from Instagram & Threads posts 
-    using public JSON/GraphQL API endpoints.
+    Fetches raw image bytes from Instagram/Threads using Cobalt API.
+    Bypasses Meta IP blocks reliably.
     """
+    cobalt_instances = [
+        "https://api.cobalt.tools/api/json",
+        "https://cobalt-api.kwiatekmoments.com/api/json",
+        "https://co.wuk.sh/api/json"
+    ]
+    
     headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
-        "Accept": "*/*",
-        "X-IG-App-ID": "936619743392459"  # Instagram/Threads Public App ID
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    }
+    
+    payload = {
+        "url": url,
+        "downloadMode": "auto"
     }
 
-    # Resolve short share redirects first
-    try:
-        if "/share/" in url or "threads.com" in url or "instagr.am" in url:
-            r = requests.get(url, headers=headers, allow_redirects=True, timeout=8)
-            url = r.url
-    except Exception as e:
-        logging.error(f"Redirect failed: {e}")
-
-    # Extract shortcode (e.g., Cxxxxxx or 40aVA-GF...)
-    match = re.search(r'/(?:p|post|reel|t|share)/([A-Za-z0-9_-]+)', url)
-    if not match:
-        return []
-    
-    code = match.group(1)
     img_urls = []
 
-    # API Attempt 1: Instagram/Threads GraphQL Post API Endpoint
-    try:
-        api_url = f"https://www.instagram.com/p/{code}/?__a=1&__d=dis"
-        res = requests.get(api_url, headers=headers, timeout=8)
-        if res.status_code == 200:
-            data = res.json()
-            items = data.get('items', [{}])[0]
-            
-            # Carousel Multi-Photo Post
-            if 'carousel_media' in items:
-                for media in items['carousel_media']:
-                    candidates = media.get('image_versions2', {}).get('candidates', [])
-                    if candidates:
-                        img_urls.append(candidates[0]['url'])
-            # Single Photo Post
-            elif 'image_versions2' in items:
-                candidates = items['image_versions2'].get('candidates', [])
-                if candidates:
-                    img_urls.append(candidates[0]['url'])
-    except Exception as e:
-        logging.error(f"API 1 failed: {e}")
+    for api_endpoint in cobalt_instances:
+        try:
+            res = requests.post(api_endpoint, json=payload, headers=headers, timeout=12)
+            if res.status_code == 200:
+                data = res.json()
+                
+                # Single photo or direct stream
+                if data.get("status") in ["tunnel", "redirect"] and data.get("url"):
+                    img_urls.append(data["url"])
+                    break
+                
+                # Multi-photo carousel
+                elif data.get("status") == "picker" and data.get("picker"):
+                    for item in data["picker"]:
+                        if item.get("type") == "photo" or item.get("thumb"):
+                            img_urls.append(item.get("url") or item.get("thumb"))
+                    if img_urls:
+                        break
+        except Exception as e:
+            logging.error(f"Cobalt instance error ({api_endpoint}): {e}")
 
-    # API Attempt 2: Direct Embed Scrape Fallback
+    # Fallback to direct oEmbed/Embed if Cobalt is busy
     if not img_urls:
         try:
-            embed_url = f"https://www.threads.net/t/{code}/embed" if "threads" in url else f"https://www.instagram.com/p/{code}/embed"
-            res = requests.get(embed_url, headers=headers, timeout=8)
-            if res.status_code == 200:
-                # Search for scontent image URLs
-                found = re.findall(r'https://scontent[^\s"\'<]+', res.text)
-                for u in found:
-                    clean_u = u.replace('\\u0026', '&').replace('\\/', '/')
-                    if not any(x in clean_u for x in ['150x150', '320x320', '480x480']):
-                        if clean_u not in img_urls:
-                            img_urls.append(clean_u)
+            match = re.search(r'/(?:p|post|reel|t|share)/([A-Za-z0-9_-]+)', url)
+            if match:
+                code = match.group(1)
+                embed_url = f"https://www.threads.net/t/{code}/embed" if "threads" in url else f"https://www.instagram.com/p/{code}/embed"
+                res = requests.get(embed_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+                if res.status_code == 200:
+                    found = re.findall(r'https://scontent[^\s"\'<]+', res.text)
+                    for u in found:
+                        clean_u = u.replace('\\u0026', '&').replace('\\/', '/')
+                        if not any(x in clean_u for x in ['150x150', '320x320', '480x480']):
+                            if clean_u not in img_urls:
+                                img_urls.append(clean_u)
         except Exception as e:
-            logging.error(f"API 2 failed: {e}")
+            logging.error(f"Embed fallback failed: {e}")
 
-    # Step 1 Finish: Download raw image bytes from CDN
+    # Step 1 Output: Download image bytes from extracted URLs
     image_bytes_list = []
     for img_url in img_urls:
         try:
-            img_res = requests.get(img_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
-            if img_res.status_code == 200 and len(img_res.content) > 10000:
+            img_res = requests.get(img_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+            if img_res.status_code == 200 and len(img_res.content) > 5000:
                 image_bytes_list.append(img_res.content)
         except Exception as err:
-            logging.error(f"Failed to download image byte: {err}")
+            logging.error(f"Download image failed: {err}")
 
     return image_bytes_list
 
@@ -390,7 +388,7 @@ def handle_text_inputs(message):
         url = link_match.group(0) if link_match else text
         bot.send_message(chat_id, "🔍 <i>Downloading post images...</i>")
         try:
-            # 1. Download post images
+            # Step 1: Download post images using Cobalt API
             image_bytes_list = fetch_meta_post_images(url)
             
             if not image_bytes_list:
@@ -404,7 +402,7 @@ def handle_text_inputs(message):
 
             bot.send_message(chat_id, f"✅ Downloaded {len(image_bytes_list)} image(s)! Generating PDF...")
             
-            # 2. Make PDF
+            # Step 2: Make PDF
             pdf_buffer = process_images_to_pdf(image_bytes_list, session.get('layout_mode', '1_per_page'))
 
             if pdf_buffer:
