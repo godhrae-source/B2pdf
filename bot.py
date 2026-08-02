@@ -16,7 +16,7 @@ def run_dummy_server():
 
 threading.Thread(target=run_dummy_server, daemon=True).start()
 
-# 2. HEAVY IMPORTS
+# 2. IMPORTS
 import io
 import re
 import time
@@ -72,9 +72,6 @@ def enhance_newspaper_image(pil_img):
     sharpened = sharp_enhancer.enhance(2.0)
     return sharpened.convert('RGB')
 
-def create_a4_canvas():
-    return Image.new('RGB', (A4_WIDTH, A4_HEIGHT), (255, 255, 255))
-
 # RAM-OPTIMIZED PDF PROCESSOR
 def process_images_to_pdf(image_bytes_list, layout_mode="1_per_page"):
     pdf_pages = []
@@ -112,66 +109,75 @@ def process_images_to_pdf(image_bytes_list, layout_mode="1_per_page"):
         return output_buffer
     return None
 
-# --- MULTI-PHOTO THREADS SCRAPER ---
+# --- ENHANCED THREADS SCRAPER ---
 def extract_images_from_threads(threads_url):
-    threads_url = threads_url.split('?')[0]
-    if not threads_url.endswith('/'):
-        threads_url += '/'
+    # Extract post ID / shortcode
+    post_code_match = re.search(r'/(?:post|t)/([A-Za-z0-9_-]+)', threads_url)
+    post_code = post_code_match.group(1) if post_code_match else None
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-Mode": "navigate",
     }
     
     img_urls = []
 
+    # Strategy 1: Fetch through mobile browser session
     try:
-        response = requests.get(threads_url, headers=headers, timeout=12)
+        clean_url = f"https://www.threads.net/t/{post_code}/" if post_code else threads_url
+        response = requests.get(clean_url, headers=headers, timeout=10)
         if response.status_code == 200:
-            html_content = response.text
+            html = response.text
             
-            # Scrape deep JSON payload script tags (Extracts ALL carousel slide photos)
-            json_scripts = re.findall(r'<script type="application/json"[^>]*>(.*?)</script>', html_content, re.DOTALL)
-            for script in json_scripts:
-                if 'image_versions2' in script or 'candidates' in script or 'scontent' in script:
-                    raw_urls = re.findall(r'https://scontent[^\s"\'\\]+', script)
-                    for raw in raw_urls:
-                        clean = raw.replace('\\/', '/').replace('\\u0026', '&')
-                        # Filter out profile icons / small thumbnails
-                        if not any(x in clean for x in ['_s.jpg', '_a.jpg', 'p150x150', '50x50', 's150x150']):
-                            if clean not in img_urls:
-                                img_urls.append(clean)
+            # Match raw scontent links in JSON
+            matches = re.findall(r'https://scontent[^\s"\'\\]+', html)
+            for m in matches:
+                m_clean = m.replace('\\/', '/').replace('\\u0026', '&')
+                if not any(x in m_clean for x in ['_s.jpg', '_a.jpg', 'p150x150', '50x50', 's150x150']):
+                    if m_clean not in img_urls:
+                        img_urls.append(m_clean)
 
-            # Fallback to HTML meta parsing if JSON extraction returned nothing
-            if not img_urls:
-                soup = BeautifulSoup(html_content, 'html.parser')
-                for tag in soup.find_all('meta', property=['og:image', 'twitter:image']):
-                    content = tag.get('content')
-                    if content and content not in img_urls:
-                        img_urls.append(content)
-
-        logging.info(f"Found {len(img_urls)} unique raw image URLs.")
-
-        # Download image bytes
-        image_bytes_list = []
-        dl_headers = {"User-Agent": headers["User-Agent"]}
-        
-        for url in img_urls[:25]:  # Limit to max 25 images per carousel
-            try:
-                res = requests.get(url, headers=dl_headers, timeout=10)
-                if res.status_code == 200 and len(res.content) > 12000:
-                    image_bytes_list.append(res.content)
-            except Exception as err:
-                logging.error(f"Image download error: {err}")
-
-        return image_bytes_list
-
+            # OpenGraph tags check
+            soup = BeautifulSoup(html, 'html.parser')
+            for tag in soup.find_all('meta', property=['og:image', 'twitter:image']):
+                c = tag.get('content')
+                if c and c not in img_urls:
+                    img_urls.append(c)
     except Exception as e:
-        logging.error(f"Threads extraction failed: {e}")
-        return []
+        logging.error(f"Strategy 1 failed: {e}")
 
-# --- FULL MENU KEYBOARD ---
+    # Strategy 2: OEmbed API fallback
+    if not img_urls and post_code:
+        try:
+            oembed_api = f"https://www.threads.net/oembed?url=https://www.threads.net/t/{post_code}"
+            res = requests.get(oembed_api, headers=headers, timeout=8)
+            if res.status_code == 200:
+                data = res.json()
+                if 'thumbnail_url' in data:
+                    img_urls.append(data['thumbnail_url'])
+        except Exception as e:
+            logging.error(f"Strategy 2 failed: {e}")
+
+    logging.info(f"Extracted {len(img_urls)} unique image URLs.")
+
+    # Download image bytes
+    image_bytes_list = []
+    dl_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    
+    for url in img_urls[:25]:
+        try:
+            r = requests.get(url, headers=dl_headers, timeout=10)
+            if r.status_code == 200 and len(r.content) > 12000:
+                image_bytes_list.append(r.content)
+        except Exception as err:
+            logging.error(f"Download fail: {err}")
+
+    return image_bytes_list
+
+# --- MENU KEYBOARD ---
 def get_main_keyboard():
     markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     btn1 = types.KeyboardButton("📸 Photos to PDF")
@@ -373,21 +379,26 @@ def handle_text_inputs(message):
     
     if threads_match or session['state'] == 'WAIT_THREADS_LINK':
         url = threads_match.group(0) if threads_match else text
-        bot.send_message(chat_id, "🔍 <i>Extracting all images from post...</i>")
+        bot.send_message(chat_id, "🔍 <i>Fetching post images...</i>")
         try:
             images = extract_images_from_threads(url)
             if not images:
-                bot.send_message(chat_id, "❌ Could not find images in this post.")
+                bot.send_message(
+                    chat_id, 
+                    "❌ <b>Could not extract images from this post.</b>\n\n"
+                    "• Make sure the post contains static images (not videos or text-only).\n"
+                    "• Make sure the Threads profile is public."
+                )
                 return
 
-            bot.send_message(chat_id, f"✅ Found {len(images)} image(s)! Converting all pages to PDF...")
+            bot.send_message(chat_id, f"✅ Found {len(images)} image(s)! Creating PDF...")
             pdf_buffer = process_images_to_pdf(images, layout_mode="1_per_page")
 
             if pdf_buffer:
                 bot.send_document(
                     chat_id, 
                     ("threads_post.pdf", pdf_buffer.getvalue()), 
-                    caption=f"✅ <b>Threads PDF Ready!</b>\nDownloaded {len(images)} images."
+                    caption=f"✅ <b>Threads PDF Ready!</b>\nIncluded {len(images)} images."
                 )
         except Exception as e:
             bot.send_message(chat_id, f"❌ Failed: {e}")
