@@ -2,7 +2,7 @@ import os
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# 1. IMMEDIATE WEBSERVER START (Prevents Render Free Plan Port Scan Timeout)
+# 1. IMMEDIATE WEBSERVER START (Prevents Render Timeout)
 class DummyServer(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -110,93 +110,104 @@ def process_images_to_pdf(image_bytes_list, layout_mode="1_per_page"):
         return output_buffer
     return None
 
-# --- RECURSIVE JSON PARSER FOR CAROUSEL SLIDES ---
-def extract_all_carousel_urls(obj, found_urls):
-    if isinstance(obj, dict):
-        if "candidates" in obj and isinstance(obj["candidates"], list):
-            if len(obj["candidates"]) > 0 and "url" in obj["candidates"][0]:
-                found_urls.append(obj["candidates"][0]["url"])
-        elif "image_versions2" in obj and isinstance(obj["image_versions2"], dict):
-            candidates = obj["image_versions2"].get("candidates", [])
-            if candidates and "url" in candidates[0]:
-                found_urls.append(candidates[0]["url"])
-        
-        for k, v in obj.items():
-            extract_all_carousel_urls(v, found_urls)
-    elif isinstance(obj, list):
-        for item in obj:
-            extract_all_carousel_urls(item, found_urls)
+# --- STRICT THREADS SCRAPER (ONLY TARGET POST MEDIA) ---
+def extract_target_post_urls(data, post_code):
+    urls = []
+    
+    def search_node(node):
+        if isinstance(node, dict):
+            # Target the post containing our code
+            if node.get('code') == post_code or node.get('pk'):
+                # Check for carousel slides (multi-image post)
+                carousel = node.get('carousel_media') or node.get('carousel_media_count')
+                if isinstance(carousel, list):
+                    for item in carousel:
+                        candidates = item.get('image_versions2', {}).get('candidates', [])
+                        if candidates:
+                            urls.append(candidates[0]['url'])
+                    return
 
-# --- ADVANCED THREADS SCRAPER WITH MD5 DEDUPLICATION ---
+                # Check for single image post
+                image_versions = node.get('image_versions2', {}).get('candidates', [])
+                if image_versions:
+                    urls.append(image_versions[0]['url'])
+                    return
+
+            for key, val in node.items():
+                search_node(val)
+        elif isinstance(node, list):
+            for item in node:
+                search_node(item)
+
+    search_node(data)
+    return urls
+
 def extract_images_from_threads(threads_url):
     post_code_match = re.search(r'/(?:post|t)/([A-Za-z0-9_-]+)', threads_url)
     post_code = post_code_match.group(1) if post_code_match else None
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Sec-Fetch-Mode": "navigate"
     }
     
     img_urls = []
 
     try:
         clean_url = f"https://www.threads.net/t/{post_code}/" if post_code else threads_url
-        response = requests.get(clean_url, headers=headers, timeout=12)
+        response = requests.get(clean_url, headers=headers, timeout=10)
         if response.status_code == 200:
             html = response.text
             
-            # Extract raw embedded JSON blobs
+            # Extract JSON payload
             json_blobs = re.findall(r'<script type="application/json"[^>]*>(.*?)</script>', html, re.DOTALL)
             for blob in json_blobs:
-                if 'image_versions2' in blob or 'carousel_media' in blob or 'candidates' in blob:
+                if 'image_versions2' in blob:
                     try:
                         data = json.loads(blob)
-                        extract_all_carousel_urls(data, img_urls)
+                        found = extract_target_post_urls(data, post_code)
+                        if found:
+                            img_urls.extend(found)
+                            break # Stop once the exact post media is found
                     except Exception:
                         pass
 
-            # Fallback regex search for images if JSON parser was empty
-            if not img_urls:
-                raw_matches = re.findall(r'https://scontent[^\s"\'\\]+', html)
-                for m in raw_matches:
-                    m_clean = m.replace('\\/', '/').replace('\\u0026', '&')
-                    if not any(x in m_clean for x in ['_s.jpg', '_a.jpg', 'p150x150', '50x50', 's150x150', 'e15']):
-                        img_urls.append(m_clean)
-
-            # Og tag fallback
+            # OpenGraph Fallback if JSON search fails
             if not img_urls:
                 soup = BeautifulSoup(html, 'html.parser')
                 for tag in soup.find_all('meta', property=['og:image', 'twitter:image']):
                     c = tag.get('content')
-                    if c:
+                    if c and c not in img_urls:
                         img_urls.append(c)
 
     except Exception as e:
-        logging.error(f"Carousel Extraction Error: {e}")
+        logging.error(f"Post Extraction Error: {e}")
 
-    # Clean URL strings
-    clean_urls = [u.replace('\\/', '/').replace('\\u0026', '&') for u in img_urls]
+    # Remove duplicates
+    unique_urls = []
+    for u in img_urls:
+        u_clean = u.replace('\\/', '/').replace('\\u0026', '&')
+        if u_clean not in unique_urls:
+            unique_urls.append(u_clean)
 
-    # Download image bytes and eliminate duplicates via Content MD5 Hashing
+    # Download unique slides
     image_bytes_list = []
-    seen_image_hashes = set()
+    seen_hashes = set()
     dl_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     
-    for url in clean_urls:
+    for url in unique_urls:
         try:
             r = requests.get(url, headers=dl_headers, timeout=8)
-            if r.status_code == 200 and len(r.content) > 12000:
-                # Generate Hash of raw image bytes to ensure absolute uniqueness
+            if r.status_code == 200 and len(r.content) > 15000: # Filter out tiny icons
                 img_hash = hashlib.md5(r.content).hexdigest()
-                if img_hash not in seen_image_hashes:
-                    seen_image_hashes.add(img_hash)
+                if img_hash not in seen_hashes:
+                    seen_hashes.add(img_hash)
                     image_bytes_list.append(r.content)
         except Exception as err:
             logging.error(f"Download fail: {err}")
 
-    logging.info(f"Downloaded {len(image_bytes_list)} unique slide images.")
+    logging.info(f"Filtered down to {len(image_bytes_list)} actual post image(s).")
     return image_bytes_list
 
 # --- MENU KEYBOARD ---
@@ -401,26 +412,26 @@ def handle_text_inputs(message):
     
     if threads_match or session['state'] == 'WAIT_THREADS_LINK':
         url = threads_match.group(0) if threads_match else text
-        bot.send_message(chat_id, "🔍 <i>Extracting unique post images...</i>")
+        bot.send_message(chat_id, "🔍 <i>Fetching post images...</i>")
         try:
             images = extract_images_from_threads(url)
             if not images:
                 bot.send_message(
                     chat_id, 
-                    "❌ <b>Could not extract images from this post.</b>\n\n"
-                    "• Ensure the post contains images/slides.\n"
-                    "• Ensure the user account is public."
+                    "❌ <b>Could not extract post images.</b>\n\n"
+                    "• Ensure the post contains photos.\n"
+                    "• Ensure the post is from a public profile."
                 )
                 return
 
-            bot.send_message(chat_id, f"✅ Found {len(images)} unique slide(s)! Creating PDF...")
+            bot.send_message(chat_id, f"✅ Found {len(images)} slide(s)! Creating PDF...")
             pdf_buffer = process_images_to_pdf(images, layout_mode="1_per_page")
 
             if pdf_buffer:
                 bot.send_document(
                     chat_id, 
-                    ("threads_carousel.pdf", pdf_buffer.getvalue()), 
-                    caption=f"✅ <b>Threads PDF Ready!</b>\nGenerated a {len(images)}-page document."
+                    ("threads_post.pdf", pdf_buffer.getvalue()), 
+                    caption=f"✅ <b>Threads PDF Ready!</b>\nExtracted exactly {len(images)} page(s)."
                 )
         except Exception as e:
             bot.send_message(chat_id, f"❌ Failed: {e}")
