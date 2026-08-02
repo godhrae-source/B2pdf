@@ -1,8 +1,12 @@
 import os
+import io
+import re
+import time
+import logging
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# 1. IMMEDIATE WEBSERVER START (Prevents Render Timeout)
+# 1. IMMEDIATE WEBSERVER START (Prevents Render Web Timeout)
 class DummyServer(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -17,18 +21,12 @@ def run_dummy_server():
 threading.Thread(target=run_dummy_server, daemon=True).start()
 
 # 2. IMPORTS
-import io
-import re
-import time
-import json
-import logging
-import hashlib
 import requests
-from bs4 import BeautifulSoup
 from PIL import Image, ImageEnhance, ImageOps
 from pypdf import PdfReader, PdfWriter
 import telebot
 from telebot import types
+import yt_dlp
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -65,33 +63,16 @@ def reset_user_session(chat_id):
             "active_pdf_name": "document.pdf"
         }
 
-def enhance_newspaper_image(pil_img):
-    gray = pil_img.convert('L')
-    enhancer = ImageEnhance.Contrast(gray)
-    contrasted = enhancer.enhance(1.8)
-    sharp_enhancer = ImageEnhance.Sharpness(contrasted)
-    sharpened = sharp_enhancer.enhance(2.0)
-    return sharpened.convert('RGB')
-
-# RAM-OPTIMIZED PDF PROCESSOR
-def process_images_to_pdf(image_bytes_list, layout_mode="1_per_page"):
+def process_images_to_pdf(image_bytes_list):
     pdf_pages = []
-    
     for b in image_bytes_list:
         try:
             img = Image.open(io.BytesIO(b))
             if img.mode != 'RGB':
                 img = img.convert('RGB')
-            
             img.thumbnail((A4_WIDTH, A4_HEIGHT), Image.Resampling.LANCZOS)
-
-            if layout_mode == "newspaper":
-                enhanced = enhance_newspaper_image(img)
-                filled_img = ImageOps.fit(enhanced, (A4_WIDTH, A4_HEIGHT), Image.Resampling.LANCZOS)
-                pdf_pages.append(filled_img)
-            else:
-                filled_img = ImageOps.fit(img, (A4_WIDTH, A4_HEIGHT), Image.Resampling.LANCZOS)
-                pdf_pages.append(filled_img)
+            filled_img = ImageOps.fit(img, (A4_WIDTH, A4_HEIGHT), Image.Resampling.LANCZOS)
+            pdf_pages.append(filled_img)
         except Exception as e:
             logging.error(f"Error processing image: {e}")
 
@@ -103,303 +84,73 @@ def process_images_to_pdf(image_bytes_list, layout_mode="1_per_page"):
             save_all=True,
             append_images=pdf_pages[1:],
             resolution=100.0,
-            quality=75,
+            quality=85,
             optimize=True
         )
         output_buffer.seek(0)
         return output_buffer
     return None
 
-# --- STRICT THREADS SCRAPER (ONLY TARGET POST MEDIA) ---
-def extract_target_post_urls(data, post_code):
-    urls = []
-    
-    def search_node(node):
-        if isinstance(node, dict):
-            # Target the post containing our code
-            if node.get('code') == post_code or node.get('pk'):
-                # Check for carousel slides (multi-image post)
-                carousel = node.get('carousel_media') or node.get('carousel_media_count')
-                if isinstance(carousel, list):
-                    for item in carousel:
-                        candidates = item.get('image_versions2', {}).get('candidates', [])
-                        if candidates:
-                            urls.append(candidates[0]['url'])
-                    return
-
-                # Check for single image post
-                image_versions = node.get('image_versions2', {}).get('candidates', [])
-                if image_versions:
-                    urls.append(image_versions[0]['url'])
-                    return
-
-            for key, val in node.items():
-                search_node(val)
-        elif isinstance(node, list):
-            for item in node:
-                search_node(item)
-
-    search_node(data)
-    return urls
-
+# --- RELIABLE THREADS EXTRACTION USING YT-DLP ---
 def extract_images_from_threads(threads_url):
-    post_code_match = re.search(r'/(?:post|t)/([A-Za-z0-9_-]+)', threads_url)
-    post_code = post_code_match.group(1) if post_code_match else None
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': False,
     }
     
     img_urls = []
-
-    try:
-        clean_url = f"https://www.threads.net/t/{post_code}/" if post_code else threads_url
-        response = requests.get(clean_url, headers=headers, timeout=10)
-        if response.status_code == 200:
-            html = response.text
-            
-            # Extract JSON payload
-            json_blobs = re.findall(r'<script type="application/json"[^>]*>(.*?)</script>', html, re.DOTALL)
-            for blob in json_blobs:
-                if 'image_versions2' in blob:
-                    try:
-                        data = json.loads(blob)
-                        found = extract_target_post_urls(data, post_code)
-                        if found:
-                            img_urls.extend(found)
-                            break # Stop once the exact post media is found
-                    except Exception:
-                        pass
-
-            # OpenGraph Fallback if JSON search fails
-            if not img_urls:
-                soup = BeautifulSoup(html, 'html.parser')
-                for tag in soup.find_all('meta', property=['og:image', 'twitter:image']):
-                    c = tag.get('content')
-                    if c and c not in img_urls:
-                        img_urls.append(c)
-
-    except Exception as e:
-        logging.error(f"Post Extraction Error: {e}")
-
-    # Remove duplicates
-    unique_urls = []
-    for u in img_urls:
-        u_clean = u.replace('\\/', '/').replace('\\u0026', '&')
-        if u_clean not in unique_urls:
-            unique_urls.append(u_clean)
-
-    # Download unique slides
-    image_bytes_list = []
-    seen_hashes = set()
-    dl_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     
-    for url in unique_urls:
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
-            r = requests.get(url, headers=dl_headers, timeout=8)
-            if r.status_code == 200 and len(r.content) > 15000: # Filter out tiny icons
-                img_hash = hashlib.md5(r.content).hexdigest()
-                if img_hash not in seen_hashes:
-                    seen_hashes.add(img_hash)
-                    image_bytes_list.append(r.content)
+            info = ydl.extract_info(threads_url, download=False)
+            
+            # Check for multiple carousel entries/slides
+            if 'entries' in info:
+                for entry in info['entries']:
+                    if entry.get('url'):
+                        img_urls.append(entry['url'])
+                    elif entry.get('thumbnails'):
+                        img_urls.append(entry['thumbnails'][-1]['url'])
+            # Check for direct single post image
+            elif info.get('url'):
+                img_urls.append(info['url'])
+            elif info.get('thumbnails'):
+                img_urls.append(info['thumbnails'][-1]['url'])
+                
+        except Exception as e:
+            logging.error(f"yt-dlp extraction error: {e}")
+
+    # Download unique slide bytes
+    image_bytes_list = []
+    headers = {"User-Agent": "Mozilla/5.0"}
+    
+    for url in img_urls:
+        try:
+            r = requests.get(url, headers=headers, timeout=10)
+            if r.status_code == 200 and len(r.content) > 10000:
+                image_bytes_list.append(r.content)
         except Exception as err:
             logging.error(f"Download fail: {err}")
 
-    logging.info(f"Filtered down to {len(image_bytes_list)} actual post image(s).")
     return image_bytes_list
 
 # --- MENU KEYBOARD ---
 def get_main_keyboard():
     markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     btn1 = types.KeyboardButton("📸 Photos to PDF")
-    btn2 = types.KeyboardButton("📰 Newspaper HD Scanner")
-    btn3 = types.KeyboardButton("🧵 Threads to PDF")
-    btn4 = types.KeyboardButton("📑 Merge PDFs")
-    btn5 = types.KeyboardButton("✂️ Delete PDF Pages")
-    btn6 = types.KeyboardButton("🗜️ Compress PDF")
-    btn7 = types.KeyboardButton("🔒 Protect / Unlock PDF")
-    btn8 = types.KeyboardButton("📝 Extract Text")
-    btn9 = types.KeyboardButton("🔄 Home / Restart")
-    markup.add(btn1, btn2, btn3, btn4, btn5, btn6, btn7, btn8, btn9)
+    btn2 = types.KeyboardButton("🧵 Threads to PDF")
+    btn3 = types.KeyboardButton("📑 Merge PDFs")
+    btn4 = types.KeyboardButton("🔄 Home / Restart")
+    markup.add(btn1, btn2, btn3, btn4)
     return markup
 
 @bot.message_handler(commands=['start', 'help'])
-@bot.message_handler(func=lambda msg: msg.text in ["🔄 Home / Restart", "🔄 Reset / Clear Session"])
+@bot.message_handler(func=lambda msg: msg.text in ["🔄 Home / Restart"])
 def send_welcome(message):
     reset_user_session(message.chat.id)
-    welcome_text = (
-        "<b>✨ Welcome to your PDF Organizer Bot!</b>\n\n"
-        "Select an option below, send a file, or paste a <b>Threads post link</b> to start:"
-    )
+    welcome_text = "<b>✨ PDF Converter Bot</b>\n\nPaste a <b>Threads link</b> or select an option below:"
     bot.send_message(message.chat.id, welcome_text, reply_markup=get_main_keyboard())
-
-# --- BUTTON COMMAND HANDLERS ---
-@bot.message_handler(func=lambda msg: msg.text == "📸 Photos to PDF")
-def photos_to_pdf_start(message):
-    session = get_user_session(message.chat.id)
-    reset_user_session(message.chat.id)
-    session['state'] = 'COLLECTING_IMAGES'
-    bot.send_message(message.chat.id, "📸 <b>Send me your photos now!</b>")
-
-@bot.message_handler(func=lambda msg: msg.text == "📰 Newspaper HD Scanner")
-def newspaper_start(message):
-    session = get_user_session(message.chat.id)
-    reset_user_session(message.chat.id)
-    session['state'] = 'COLLECTING_IMAGES'
-    session['layout_mode'] = 'newspaper'
-    bot.send_message(message.chat.id, "📰 <b>Newspaper HD Scanner Active!</b>\n\nSend your screenshots/photos now.")
-
-@bot.message_handler(func=lambda msg: msg.text == "🧵 Threads to PDF")
-def threads_start(message):
-    reset_user_session(message.chat.id)
-    session = get_user_session(message.chat.id)
-    session['state'] = 'WAIT_THREADS_LINK'
-    bot.send_message(message.chat.id, "🧵 <b>Paste any Threads post URL below:</b>")
-
-@bot.message_handler(func=lambda msg: msg.text == "📑 Merge PDFs")
-def merge_start(message):
-    reset_user_session(message.chat.id)
-    session = get_user_session(message.chat.id)
-    session['state'] = 'MERGE_PDFS'
-    bot.send_message(message.chat.id, "📑 <b>Merge PDFs Mode:</b>\n\nSend 2 or more PDF files one by one.")
-
-@bot.message_handler(func=lambda msg: msg.text == "✂️ Delete PDF Pages")
-def delete_pages_start(message):
-    reset_user_session(message.chat.id)
-    session = get_user_session(message.chat.id)
-    session['state'] = 'DELETE_PAGES'
-    bot.send_message(message.chat.id, "✂️ <b>Delete Pages Mode:</b>\n\nSend me your PDF file.")
-
-@bot.message_handler(func=lambda msg: msg.text == "🗜️ Compress PDF")
-def compress_start(message):
-    reset_user_session(message.chat.id)
-    session = get_user_session(message.chat.id)
-    session['state'] = 'COMPRESS_PDF'
-    bot.send_message(message.chat.id, "🗜️ <b>Compress PDF Mode:</b>\n\nSend me your PDF file.")
-
-@bot.message_handler(func=lambda msg: msg.text == "🔒 Protect / Unlock PDF")
-def protect_start(message):
-    reset_user_session(message.chat.id)
-    session = get_user_session(message.chat.id)
-    session['state'] = 'PROTECT_PDF'
-    bot.send_message(message.chat.id, "🔒 <b>Protect / Unlock PDF Mode:</b>\n\nSend me your PDF file.")
-
-@bot.message_handler(func=lambda msg: msg.text == "📝 Extract Text")
-def extract_text_start(message):
-    reset_user_session(message.chat.id)
-    session = get_user_session(message.chat.id)
-    session['state'] = 'EXTRACT_TEXT'
-    bot.send_message(message.chat.id, "📝 <b>Extract Text Mode:</b>\n\nSend me your PDF file.")
-
-# --- PHOTO HANDLER ---
-@bot.message_handler(content_types=['photo'])
-def receive_image(message):
-    session = get_user_session(message.chat.id)
-    session['state'] = 'COLLECTING_IMAGES'
-    try:
-        file_id = message.photo[-1].file_id
-        file_info = bot.get_file(file_id)
-        downloaded_file = bot.download_file(file_info.file_path)
-        session['images'].append(downloaded_file)
-        
-        markup = types.InlineKeyboardMarkup()
-        markup.add(
-            types.InlineKeyboardButton(f"⚙️ Generate PDF ({len(session['images'])} Photos)", callback_data="build_image_pdf"),
-            types.InlineKeyboardButton("❌ Clear", callback_data="clear_images")
-        )
-        bot.reply_to(message, f"✅ Photo #{len(session['images'])} received!", reply_markup=markup)
-    except Exception as e:
-        logging.error(f"Error: {e}")
-
-# --- DOCUMENT HANDLER ---
-@bot.message_handler(content_types=['document'])
-def handle_document(message):
-    session = get_user_session(message.chat.id)
-    doc = message.document
-
-    if doc.mime_type and doc.mime_type.startswith("image/"):
-        file_info = bot.get_file(doc.file_id)
-        downloaded_file = bot.download_file(file_info.file_path)
-        session['images'].append(downloaded_file)
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton(f"⚙️ Generate PDF ({len(session['images'])} Photos)", callback_data="build_image_pdf"))
-        bot.reply_to(message, f"✅ Photo #{len(session['images'])} received!", reply_markup=markup)
-        return
-
-    if not doc.file_name.lower().endswith('.pdf'):
-        bot.reply_to(message, "❌ Please send a valid `.pdf` document or photo.")
-        return
-
-    file_info = bot.get_file(doc.file_id)
-    session['active_pdf_bytes'] = bot.download_file(file_info.file_path)
-    session['active_pdf_name'] = doc.file_name
-
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        types.InlineKeyboardButton("🗜️ Compress PDF", callback_data="act_compress"),
-        types.InlineKeyboardButton("🔒 Protect / Unlock", callback_data="act_protect_unlock"),
-        types.InlineKeyboardButton("✂️ Delete Pages", callback_data="act_delete_pages"),
-        types.InlineKeyboardButton("📝 Extract Text", callback_data="act_extract_text"),
-        types.InlineKeyboardButton("📑 Add to Merge Queue", callback_data="act_add_to_merge")
-    )
-
-    bot.reply_to(message, f"📄 <b>File Received:</b> <code>{doc.file_name}</code>", reply_markup=markup)
-
-# --- ACTION CALLBACK HANDLERS ---
-@bot.callback_query_handler(func=lambda call: call.data.startswith("act_"))
-def handle_action_choice(call):
-    session = get_user_session(call.message.chat.id)
-    chat_id = call.message.chat.id
-    action = call.data.replace("act_", "")
-
-    pdf_bytes = session.get('active_pdf_bytes')
-
-    if action == "compress":
-        bot.send_message(chat_id, "⏳ <i>Compressing PDF...</i>")
-        try:
-            reader = PdfReader(io.BytesIO(pdf_bytes))
-            writer = PdfWriter()
-            writer.append(reader)
-            for page in writer.pages:
-                page.compress_content_streams()
-            out = io.BytesIO()
-            writer.write(out)
-            out.seek(0)
-            bot.send_document(chat_id, (f"compressed_{session['active_pdf_name']}", out.getvalue()), caption="✅ Compressed!")
-        except Exception as e:
-            bot.send_message(chat_id, f"❌ Failed: {e}")
-
-    elif action == "protect_unlock":
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        if reader.is_encrypted:
-            session['state'] = 'WAIT_UNLOCK_PASSWORD'
-            bot.send_message(chat_id, "🔓 <b>PDF is Protected!</b> Enter password to unlock:")
-        else:
-            session['state'] = 'WAIT_PROTECT_PASSWORD'
-            bot.send_message(chat_id, "🔒 <b>Protect PDF:</b> Enter new password:")
-
-    elif action == "delete_pages":
-        session['state'] = 'WAIT_DELETE_PAGE_NUMS'
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        bot.send_message(chat_id, f"📖 PDF has {len(reader.pages)} pages. Type page numbers to delete (e.g. `1, 3` or `2-4`):")
-
-    elif action == "extract_text":
-        try:
-            reader = PdfReader(io.BytesIO(pdf_bytes))
-            full_text = "".join([f"\n--- Page {i+1} ---\n" + (p.extract_text() or "") for i, p in enumerate(reader.pages)])
-            if full_text.strip():
-                bot.send_message(chat_id, full_text[:4000])
-            else:
-                bot.send_message(chat_id, "⚠️ No readable text found.")
-        except Exception as e:
-            bot.send_message(chat_id, f"❌ Failed: {e}")
-
-    elif action == "add_to_merge":
-        session['state'] = 'MERGE_PDFS'
-        session['pdfs'].append(pdf_bytes)
-        bot.send_message(chat_id, f"📑 Added to Merge queue! ({len(session['pdfs'])} total). Send another or tap Merge.")
 
 # --- TEXT & THREADS LINK INPUTS ---
 @bot.message_handler(func=lambda msg: True)
@@ -412,95 +163,25 @@ def handle_text_inputs(message):
     
     if threads_match or session['state'] == 'WAIT_THREADS_LINK':
         url = threads_match.group(0) if threads_match else text
-        bot.send_message(chat_id, "🔍 <i>Fetching post images...</i>")
+        bot.send_message(chat_id, "🔍 <i>Processing post...</i>")
         try:
             images = extract_images_from_threads(url)
             if not images:
-                bot.send_message(
-                    chat_id, 
-                    "❌ <b>Could not extract post images.</b>\n\n"
-                    "• Ensure the post contains photos.\n"
-                    "• Ensure the post is from a public profile."
-                )
+                bot.send_message(chat_id, "❌ Could not extract images. Check if the post is public and contains photos.")
                 return
 
-            bot.send_message(chat_id, f"✅ Found {len(images)} slide(s)! Creating PDF...")
-            pdf_buffer = process_images_to_pdf(images, layout_mode="1_per_page")
+            bot.send_message(chat_id, f"✅ Extracted {len(images)} slide(s)! Generating PDF...")
+            pdf_buffer = process_images_to_pdf(images)
 
             if pdf_buffer:
                 bot.send_document(
                     chat_id, 
-                    ("threads_post.pdf", pdf_buffer.getvalue()), 
-                    caption=f"✅ <b>Threads PDF Ready!</b>\nExtracted exactly {len(images)} page(s)."
+                    ("threads_carousel.pdf", pdf_buffer.getvalue()), 
+                    caption=f"✅ Done! PDF created with {len(images)} page(s)."
                 )
-        except Exception as e:
-            bot.send_message(chat_id, f"❌ Failed: {e}")
-        finally:
-            reset_user_session(chat_id)
-
-    elif session['state'] == 'WAIT_DELETE_PAGE_NUMS':
-        try:
-            pages_to_remove = set()
-            for part in text.split(','):
-                part = part.strip()
-                if '-' in part:
-                    s, e = map(int, part.split('-'))
-                    pages_to_remove.update(range(s, e + 1))
-                else:
-                    pages_to_remove.add(int(part))
-            
-            reader = PdfReader(io.BytesIO(session['active_pdf_bytes']))
-            writer = PdfWriter()
-            writer.append(reader)
-            
-            for p_num in sorted(list(pages_to_remove), reverse=True):
-                if 1 <= p_num <= len(writer.pages):
-                    writer.remove_page(p_num - 1)
-            
-            out = io.BytesIO()
-            writer.write(out)
-            out.seek(0)
-            bot.send_document(chat_id, ("edited.pdf", out.getvalue()), caption="✅ PDF updated!")
         except Exception as e:
             bot.send_message(chat_id, f"❌ Error: {e}")
         finally:
-            reset_user_session(chat_id)
-
-    elif session['state'] in ['WAIT_PROTECT_PASSWORD', 'WAIT_UNLOCK_PASSWORD']:
-        try:
-            reader = PdfReader(io.BytesIO(session['active_pdf_bytes']))
-            writer = PdfWriter()
-            if session['state'] == 'WAIT_UNLOCK_PASSWORD':
-                reader.decrypt(text)
-                writer.append(reader)
-            else:
-                writer.append(reader)
-                writer.encrypt(text)
-            out = io.BytesIO()
-            writer.write(out)
-            out.seek(0)
-            bot.send_document(chat_id, ("processed.pdf", out.getvalue()), caption="✅ Success!")
-        except Exception as e:
-            bot.send_message(chat_id, f"❌ Password Error: {e}")
-        finally:
-            reset_user_session(chat_id)
-
-# --- CALLBACK ROUTER ---
-@bot.callback_query_handler(func=lambda call: call.data in ["build_image_pdf", "clear_images"])
-def handle_callbacks(call):
-    session = get_user_session(call.message.chat.id)
-    chat_id = call.message.chat.id
-
-    if call.data == "clear_images":
-        reset_user_session(chat_id)
-        bot.send_message(chat_id, "🗑️ Cleared queue.")
-
-    elif call.data == "build_image_pdf":
-        if session['images']:
-            bot.send_message(chat_id, "⏳ Generating PDF...")
-            pdf_buffer = process_images_to_pdf(session['images'], session['layout_mode'])
-            if pdf_buffer:
-                bot.send_document(chat_id, ("document.pdf", pdf_buffer.getvalue()), caption="✅ Your PDF is ready!")
             reset_user_session(chat_id)
 
 if __name__ == "__main__":
