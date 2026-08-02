@@ -1,9 +1,7 @@
 import os
 import io
-import re
-import math
 import logging
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image, ImageEnhance
 from pypdf import PdfReader, PdfWriter
 import telebot
 from telebot import types
@@ -16,7 +14,6 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", DEFAULT_BOT_TOKEN)
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-# Temp storage for user sessions
 user_data = {}
 
 A4_WIDTH = 1240
@@ -282,7 +279,7 @@ def handle_document(message):
     file_info = bot.get_file(doc.file_id)
     pdf_bytes = bot.download_file(file_info.file_path)
 
-    # Direct File Menu Popup when sending any PDF file
+    # Store file bytes for action menu
     session['active_pdf_bytes'] = pdf_bytes
     session['active_pdf_name'] = doc.file_name
 
@@ -313,15 +310,19 @@ def handle_action_choice(call):
         bot.answer_callback_query(call.id, "Please re-send your PDF file.")
         return
 
+    # FIXED PDF COMPRESS METHOD
     if action == "compress":
         bot.answer_callback_query(call.id, "Compressing PDF...")
         bot.send_message(chat_id, "⏳ <i>Compressing PDF... Please wait.</i>")
         try:
             reader = PdfReader(io.BytesIO(pdf_bytes))
             writer = PdfWriter()
-            for page in reader.pages:
+            
+            # Copy and compress safely
+            writer.append(reader)
+            for page in writer.pages:
                 page.compress_content_streams()
-                writer.add_page(page)
+
             out = io.BytesIO()
             writer.write(out)
             out.seek(0)
@@ -390,11 +391,12 @@ def handle_text_inputs(message):
             
             reader = PdfReader(io.BytesIO(session['active_pdf_bytes']))
             writer = PdfWriter()
-            total_pages = len(reader.pages)
+            writer.append(reader)
             
-            for i in range(total_pages):
-                if (i + 1) not in pages_to_remove:
-                    writer.add_page(reader.pages[i])
+            # Delete pages from back to front to avoid index shifting
+            for p_num in sorted(list(pages_to_remove), reverse=True):
+                if 1 <= p_num <= len(writer.pages):
+                    writer.remove_page(p_num - 1)
             
             out = io.BytesIO()
             writer.write(out)
@@ -410,8 +412,7 @@ def handle_text_inputs(message):
             pwd = message.text.strip()
             reader = PdfReader(io.BytesIO(session['active_pdf_bytes']))
             writer = PdfWriter()
-            for page in reader.pages:
-                writer.add_page(page)
+            writer.append(reader)
             writer.encrypt(pwd)
             out = io.BytesIO()
             writer.write(out)
@@ -428,8 +429,7 @@ def handle_text_inputs(message):
             reader = PdfReader(io.BytesIO(session['active_pdf_bytes']))
             reader.decrypt(pwd)
             writer = PdfWriter()
-            for page in reader.pages:
-                writer.add_page(page)
+            writer.append(reader)
             out = io.BytesIO()
             writer.write(out)
             out.seek(0)
@@ -495,8 +495,7 @@ def handle_callbacks(call):
             writer = PdfWriter()
             for pdf_bytes in session['pdfs']:
                 reader = PdfReader(io.BytesIO(pdf_bytes))
-                for page in reader.pages:
-                    writer.add_page(page)
+                writer.append(reader)
             out = io.BytesIO()
             writer.write(out)
             out.seek(0)
