@@ -133,8 +133,59 @@ def process_images_to_pdf(image_bytes_list, layout_mode="1_per_page"):
     return None
 
 # --- THREADS IMAGE EXTRACTOR FUNCTION ---
+def # --- IMPROVED THREADS IMAGE EXTRACTOR FUNCTION ---
 def extract_images_from_threads(url):
+    # Use Facebook's link crawler User-Agent to bypass the login/JS wall
     headers = {
+        "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5"
+    }
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=15)
+        if response.status_code != 200:
+            logging.error(f"Threads request failed status: {response.status_code}")
+            return []
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+        image_bytes_list = []
+        img_urls = []
+
+        # 1. Search for OpenGraph images (used for link previews)
+        og_images = soup.find_all('meta', property='og:image')
+        for tag in og_images:
+            content = tag.get('content')
+            if content and content not in img_urls:
+                img_urls.append(content)
+
+        # 2. Search twitter card image fallback
+        if not img_urls:
+            tw_images = soup.find_all('meta', attrs={'name': 'twitter:image'})
+            for tag in tw_images:
+                content = tag.get('content')
+                if content and content not in img_urls:
+                    img_urls.append(content)
+
+        # Download discovered images
+        dl_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+
+        for img_url in img_urls:
+            try:
+                img_resp = requests.get(img_url, headers=dl_headers, timeout=10)
+                if img_resp.status_code == 200 and len(img_resp.content) > 5000: # filter out tiny icons
+                    image_bytes_list.append(img_resp.content)
+            except Exception as err:
+                logging.error(f"Error fetching image {img_url}: {err}")
+
+        return image_bytes_list
+
+    except Exception as e:
+        logging.error(f"Threads extraction exception: {e}")
+        return []
+
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
         "Accept-Language": "en-US,en;q=0.9"
     }
