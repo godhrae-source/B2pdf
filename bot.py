@@ -3,12 +3,14 @@ import io
 import re
 import time
 import logging
+import threading
 import requests
 from bs4 import BeautifulSoup
 from PIL import Image, ImageEnhance, ImageOps
 from pypdf import PdfReader, PdfWriter
 import telebot
 from telebot import types
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -22,6 +24,21 @@ user_data = {}
 
 A4_WIDTH = 1240
 A4_HEIGHT = 1754
+
+# --- DUMMY SERVER TO SATISFY RENDER FREE PLAN PORT SCAN ---
+class DummyServer(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is live and running!")
+
+def run_dummy_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(('0.0.0.0', port), DummyServer)
+    server.serve_forever()
+
+# Start dummy HTTP server in background thread so Render Free Web Service doesn't time out
+threading.Thread(target=run_dummy_server, daemon=True).start()
 
 def get_user_session(chat_id):
     if chat_id not in user_data:
@@ -132,111 +149,54 @@ def process_images_to_pdf(image_bytes_list, layout_mode="1_per_page"):
         return output_buffer
     return None
 
-# --- BYPASS META BLOCKS (RELIABLE THREADS & INSTAGRAM SCRAPER) ---
-def extract_images_from_social_link(url):
+# --- WORKING THREADS SCRAPER ---
+def extract_images_from_threads(threads_url):
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
+        "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
     }
     
-    img_urls = []
-
     try:
-        # --- INSTAGRAM HANDLING ---
-        if 'instagram.com' in url:
-            match = re.search(r'instagram\.com/(?:p|reel|reels|tv)/([^/?#&]+)', url)
-            if match:
-                shortcode = match.group(1)
+        response = requests.get(threads_url, headers=headers, timeout=12)
+        if response.status_code != 200:
+            logging.error(f"Threads request failed with status: {response.status_code}")
+            return []
 
-                # Method 1: Fetch via DDInstagram API
-                try:
-                    proxy_url = f"https://api.ddinstagram.com/post/{shortcode}"
-                    resp = requests.get(proxy_url, headers=headers, timeout=8)
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        if 'item' in data:
-                            item = data['item']
-                            # Carousel photos
-                            if 'carousel_media' in item:
-                                for media in item['carousel_media']:
-                                    candidates = media.get('image_versions2', {}).get('candidates', [])
-                                    if candidates:
-                                        img_urls.append(candidates[0]['url'])
-                            # Single photo
-                            elif 'image_versions2' in item:
-                                candidates = item['image_versions2'].get('candidates', [])
-                                if candidates:
-                                    img_urls.append(candidates[0]['url'])
-                except Exception as e:
-                    logging.warning(f"DDInstagram API fallback triggered: {e}")
+        html_content = response.text
+        img_urls = []
 
-                # Method 2: Fallback to Public Instagram Embed
-                if not img_urls:
-                    embed_url = f"https://www.instagram.com/p/{shortcode}/embed/captioned/"
-                    resp = requests.get(embed_url, headers=headers, timeout=10)
-                    if resp.status_code == 200:
-                        soup = BeautifulSoup(resp.text, 'html.parser')
-                        for img in soup.find_all('img'):
-                            src = img.get('src')
-                            if src and 'scontent' in src and '150x150' not in src and src not in img_urls:
-                                img_urls.append(src)
+        raw_urls = re.findall(r'https://scontent[^\s"\'\\]+', html_content)
+        if not raw_urls:
+            raw_urls = re.findall(r'https://[^\s"\'\\]*fbcdn[^\s"\'\\]+', html_content)
 
-                        if not img_urls:
-                            og_img = soup.find('meta', property='og:image')
-                            if og_img and og_img.get('content'):
-                                img_urls.append(og_img['content'])
-
-        # --- THREADS HANDLING ---
-        elif 'threads' in url:
-            clean_url = url.split('?')[0]
+        for u in raw_urls:
+            clean_url = u.replace('\\/', '/').replace('\\u0026', '&')
             
-            # Method 1: FixThreads Proxy
-            try:
-                fix_url = clean_url.replace('threads.net', 'fixthreads.net').replace('threads.com', 'fixthreads.net')
-                fix_headers = {'User-Agent': 'telegrambot'}
-                resp = requests.get(fix_url, headers=fix_headers, timeout=8)
-                if resp.status_code == 200:
-                    soup = BeautifulSoup(resp.text, 'html.parser')
-                    for meta in soup.find_all('meta', property='og:image'):
-                        content = meta.get('content')
-                        if content and content not in img_urls:
-                            img_urls.append(content)
-            except Exception as e:
-                logging.warning(f"FixThreads proxy fallback triggered: {e}")
+            if any(x in clean_url for x in ['_s.jpg', '_a.jpg', 'p150x150', 'p50x50', '150x150', '50x50']):
+                continue
+            
+            if clean_url not in img_urls:
+                img_urls.append(clean_url)
 
-            # Method 2: Threads oEmbed API
-            if not img_urls:
-                try:
-                    oembed_url = f"https://www.threads.net/oembed?url={clean_url}"
-                    oembed_resp = requests.get(oembed_url, headers=headers, timeout=6)
-                    if oembed_resp.status_code == 200:
-                        data = oembed_resp.json()
-                        if data.get('thumbnail_url'):
-                            img_urls.append(data['thumbnail_url'])
-                except Exception:
-                    pass
+        if not img_urls:
+            soup = BeautifulSoup(html_content, 'html.parser')
+            for tag in soup.find_all('meta', property='og:image'):
+                content = tag.get('content')
+                if content and content not in img_urls:
+                    img_urls.append(content)
 
-            # Method 3: Direct Meta Crawler Payload Scraping
-            if not img_urls:
-                fb_headers = {'User-Agent': 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)'}
-                resp = requests.get(clean_url, headers=fb_headers, timeout=10)
-                if resp.status_code == 200:
-                    raw_urls = re.findall(r'https://scontent[^\s"\'\\]+', resp.text)
-                    for u in raw_urls:
-                        clean_u = u.replace('\\/', '/').replace('\\u0026', '&')
-                        if not any(x in clean_u for x in ['_s.jpg', 'p150x150', 'p50x50', '150x150']):
-                            if clean_u not in img_urls:
-                                img_urls.append(clean_u)
+        logging.info(f"Extracted {len(img_urls)} unique image URLs.")
 
-        logging.info(f"Successfully extracted {len(img_urls)} image URLs.")
-
-        # Download raw image bytes
         image_bytes_list = []
+        dl_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        }
+
         for img_url in img_urls:
             try:
-                img_resp = requests.get(img_url, headers=headers, timeout=10)
-                if img_resp.status_code == 200 and len(img_resp.content) > 5000:
+                img_resp = requests.get(img_url, headers=dl_headers, timeout=10)
+                if img_resp.status_code == 200 and len(img_resp.content) > 15000:
                     image_bytes_list.append(img_resp.content)
             except Exception as err:
                 logging.error(f"Error downloading image: {err}")
@@ -244,7 +204,7 @@ def extract_images_from_social_link(url):
         return image_bytes_list
 
     except Exception as e:
-        logging.error(f"Social extraction error: {e}")
+        logging.error(f"Threads extraction exception: {e}")
         return []
 
 # --- MAIN KEYBOARD ---
@@ -252,7 +212,7 @@ def get_main_keyboard():
     markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     btn1 = types.KeyboardButton("📸 Photos to PDF")
     btn2 = types.KeyboardButton("📰 Newspaper HD Scanner")
-    btn3 = types.KeyboardButton("🧵 Threads / IG to PDF")
+    btn3 = types.KeyboardButton("🧵 Threads to PDF")
     btn4 = types.KeyboardButton("📑 Merge PDFs")
     btn5 = types.KeyboardButton("✂️ Delete PDF Pages")
     btn6 = types.KeyboardButton("🗜️ Compress PDF")
@@ -268,7 +228,7 @@ def send_welcome(message):
     reset_user_session(message.chat.id)
     welcome_text = (
         "<b>✨ Welcome to your PDF Organizer Bot!</b>\n\n"
-        "Select an option below, send a file, or paste a <b>Threads/Instagram post link</b> to start:"
+        "Select an option below, send a file, or paste a <b>Threads post link</b> to start:"
     )
     bot.send_message(message.chat.id, welcome_text, reply_markup=get_main_keyboard())
 
@@ -300,14 +260,14 @@ def newspaper_start(message):
     session['layout_mode'] = 'newspaper'
     bot.send_message(message.chat.id, "📰 <b>Newspaper HD Scanner Active!</b>\n\nSend your screenshot or photo clip now.")
 
-@bot.message_handler(func=lambda msg: msg.text == "🧵 Threads / IG to PDF")
+@bot.message_handler(func=lambda msg: msg.text == "🧵 Threads to PDF")
 def threads_start(message):
     reset_user_session(message.chat.id)
     session = get_user_session(message.chat.id)
     session['state'] = 'WAIT_THREADS_LINK'
     bot.send_message(
         message.chat.id,
-        "🧵📸 <b>Threads / Instagram Post to PDF:</b>\n\nPlease paste any Threads or Instagram post URL.\n\n<i>Examples:</i>\n<code>https://www.threads.net/@user/post/123</code>\n<code>https://www.instagram.com/p/123/</code>"
+        "🧵 <b>Threads Post to PDF:</b>\n\nPlease paste any Threads post URL.\n\n<i>Example:</i>\n<code>https://www.threads.net/@user/post/123</code>"
     )
 
 @bot.message_handler(func=lambda msg: msg.text == "📑 Merge PDFs")
@@ -416,7 +376,7 @@ def handle_document(message):
         reply_markup=markup
     )
 
-# --- ACTION CALLBACKS FOR SENT PDFS ---
+# --- ACTION CALLBACKS ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("act_"))
 def handle_action_choice(call):
     session = get_user_session(call.message.chat.id)
@@ -486,25 +446,25 @@ def handle_action_choice(call):
         session['pdfs'].append(pdf_bytes)
         bot.send_message(chat_id, f"📑 Added to Merge queue! ({len(session['pdfs'])} total). Send another PDF or tap 'Merge PDFs' in main menu.")
 
-# --- TEXT RESPONSES & SOCIAL LINK PROCESSING ---
+# --- TEXT RESPONSES & THREADS LINK HANDLING ---
 @bot.message_handler(func=lambda msg: True)
 def handle_text_inputs(message):
     session = get_user_session(message.chat.id)
     chat_id = message.chat.id
     text = message.text.strip()
 
-    social_match = re.search(r'https?://(?:www\.)?(?:threads\.(?:net|com)|instagram\.com)/[^\s]+', text)
+    threads_match = re.search(r'https?://(?:www\.)?threads\.(?:net|com)/[^\s]+', text)
     
-    if social_match or session['state'] == 'WAIT_THREADS_LINK':
-        url = social_match.group(0) if social_match else text
+    if threads_match or session['state'] == 'WAIT_THREADS_LINK':
+        url = threads_match.group(0) if threads_match else text
         if not url.startswith("http"):
-            bot.send_message(chat_id, "❌ Invalid URL format. Send a valid Threads or Instagram post link.")
+            bot.send_message(chat_id, "❌ Invalid URL format. Send a valid Threads post link.")
             return
 
         bot.send_message(chat_id, "🔍 <i>Fetching photos from post... Please wait.</i>")
         
         try:
-            images = extract_images_from_social_link(url)
+            images = extract_images_from_threads(url)
             if not images:
                 bot.send_message(chat_id, "❌ Could not find any images in that post or the account is private.")
                 return
@@ -515,8 +475,8 @@ def handle_text_inputs(message):
             if pdf_buffer:
                 bot.send_document(
                     chat_id,
-                    ("social_post.pdf", pdf_buffer.getvalue()),
-                    caption=f"✅ <b>Post PDF Ready!</b>\n\nDownloaded all {len(images)} images."
+                    ("threads_post.pdf", pdf_buffer.getvalue()),
+                    caption=f"✅ <b>Threads Post PDF Ready!</b>\n\nDownloaded all {len(images)} images."
                 )
             else:
                 bot.send_message(chat_id, "❌ Error generating PDF from post images.")
