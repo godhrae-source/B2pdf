@@ -22,6 +22,7 @@ import re
 import time
 import json
 import logging
+import hashlib
 import requests
 from bs4 import BeautifulSoup
 from PIL import Image, ImageEnhance, ImageOps
@@ -112,9 +113,7 @@ def process_images_to_pdf(image_bytes_list, layout_mode="1_per_page"):
 # --- RECURSIVE JSON PARSER FOR CAROUSEL SLIDES ---
 def extract_all_carousel_urls(obj, found_urls):
     if isinstance(obj, dict):
-        # Look for image candidates inside Threads GraphQL / HTML structure
         if "candidates" in obj and isinstance(obj["candidates"], list):
-            # Take highest quality image candidate
             if len(obj["candidates"]) > 0 and "url" in obj["candidates"][0]:
                 found_urls.append(obj["candidates"][0]["url"])
         elif "image_versions2" in obj and isinstance(obj["image_versions2"], dict):
@@ -128,7 +127,7 @@ def extract_all_carousel_urls(obj, found_urls):
         for item in obj:
             extract_all_carousel_urls(item, found_urls)
 
-# --- ADVANCED THREADS CAROUSEL SCRAPER ---
+# --- ADVANCED THREADS SCRAPER WITH MD5 DEDUPLICATION ---
 def extract_images_from_threads(threads_url):
     post_code_match = re.search(r'/(?:post|t)/([A-Za-z0-9_-]+)', threads_url)
     post_code = post_code_match.group(1) if post_code_match else None
@@ -142,7 +141,6 @@ def extract_images_from_threads(threads_url):
     
     img_urls = []
 
-    # 1. Fetch full page source
     try:
         clean_url = f"https://www.threads.net/t/{post_code}/" if post_code else threads_url
         response = requests.get(clean_url, headers=headers, timeout=12)
@@ -159,47 +157,46 @@ def extract_images_from_threads(threads_url):
                     except Exception:
                         pass
 
-            # Fallback regex search for multi-slide images inside page memory
+            # Fallback regex search for images if JSON parser was empty
             if not img_urls:
                 raw_matches = re.findall(r'https://scontent[^\s"\'\\]+', html)
                 for m in raw_matches:
                     m_clean = m.replace('\\/', '/').replace('\\u0026', '&')
                     if not any(x in m_clean for x in ['_s.jpg', '_a.jpg', 'p150x150', '50x50', 's150x150', 'e15']):
-                        if m_clean not in img_urls:
-                            img_urls.append(m_clean)
+                        img_urls.append(m_clean)
 
-            # Og tag fallback if no carousel slides found
+            # Og tag fallback
             if not img_urls:
                 soup = BeautifulSoup(html, 'html.parser')
                 for tag in soup.find_all('meta', property=['og:image', 'twitter:image']):
                     c = tag.get('content')
-                    if c and c not in img_urls:
+                    if c:
                         img_urls.append(c)
 
     except Exception as e:
         logging.error(f"Carousel Extraction Error: {e}")
 
-    # Remove duplicates while keeping order
-    unique_urls = []
-    for u in img_urls:
-        u_clean = u.replace('\\/', '/').replace('\\u0026', '&')
-        if u_clean not in unique_urls:
-            unique_urls.append(u_clean)
+    # Clean URL strings
+    clean_urls = [u.replace('\\/', '/').replace('\\u0026', '&') for u in img_urls]
 
-    logging.info(f"Found {len(unique_urls)} slide images for PDF.")
-
-    # Download unique slides
+    # Download image bytes and eliminate duplicates via Content MD5 Hashing
     image_bytes_list = []
+    seen_image_hashes = set()
     dl_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     
-    for url in unique_urls[:30]: # Up to 30 pages max per PDF
+    for url in clean_urls:
         try:
-            r = requests.get(url, headers=dl_headers, timeout=10)
+            r = requests.get(url, headers=dl_headers, timeout=8)
             if r.status_code == 200 and len(r.content) > 12000:
-                image_bytes_list.append(r.content)
+                # Generate Hash of raw image bytes to ensure absolute uniqueness
+                img_hash = hashlib.md5(r.content).hexdigest()
+                if img_hash not in seen_image_hashes:
+                    seen_image_hashes.add(img_hash)
+                    image_bytes_list.append(r.content)
         except Exception as err:
             logging.error(f"Download fail: {err}")
 
+    logging.info(f"Downloaded {len(image_bytes_list)} unique slide images.")
     return image_bytes_list
 
 # --- MENU KEYBOARD ---
@@ -404,7 +401,7 @@ def handle_text_inputs(message):
     
     if threads_match or session['state'] == 'WAIT_THREADS_LINK':
         url = threads_match.group(0) if threads_match else text
-        bot.send_message(chat_id, "🔍 <i>Extracting all pages/slides from post...</i>")
+        bot.send_message(chat_id, "🔍 <i>Extracting unique post images...</i>")
         try:
             images = extract_images_from_threads(url)
             if not images:
@@ -416,14 +413,14 @@ def handle_text_inputs(message):
                 )
                 return
 
-            bot.send_message(chat_id, f"✅ Found {len(images)} slide(s)! Creating PDF document...")
+            bot.send_message(chat_id, f"✅ Found {len(images)} unique slide(s)! Creating PDF...")
             pdf_buffer = process_images_to_pdf(images, layout_mode="1_per_page")
 
             if pdf_buffer:
                 bot.send_document(
                     chat_id, 
                     ("threads_carousel.pdf", pdf_buffer.getvalue()), 
-                    caption=f"✅ <b>Threads PDF Ready!</b>\nConverted all {len(images)} pages."
+                    caption=f"✅ <b>Threads PDF Ready!</b>\nGenerated a {len(images)}-page document."
                 )
         except Exception as e:
             bot.send_message(chat_id, f"❌ Failed: {e}")
