@@ -1,6 +1,5 @@
 pyTelegramBotAPI
+requests
 Pillow
 pypdf
-requests
 beautifulsoup4
-yt-dlp
