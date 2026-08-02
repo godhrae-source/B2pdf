@@ -86,10 +86,12 @@ def process_images_to_pdf(image_bytes_list, layout_mode="1_per_page"):
             is_tall = first_img.height > first_img.width
 
             if is_tall:
+                # SIDE BY SIDE (Left & Right)
                 box_w = A4_WIDTH // 2
                 box_h = A4_HEIGHT
                 positions = [(0, 0), (box_w, 0)]
             else:
+                # TOP AND BOTTOM (Up & Down)
                 box_w = A4_WIDTH
                 box_h = A4_HEIGHT // 2
                 positions = [(0, 0), (0, box_h)]
@@ -132,10 +134,9 @@ def process_images_to_pdf(image_bytes_list, layout_mode="1_per_page"):
         return output_buffer
     return None
 
-# --- THREADS IMAGE EXTRACTOR FUNCTION ---
-def # --- IMPROVED THREADS IMAGE EXTRACTOR FUNCTION ---
+# --- THREADS IMAGE EXTRACTOR ---
 def extract_images_from_threads(url):
-    # Use Facebook's link crawler User-Agent to bypass the login/JS wall
+    # Uses Facebook crawler User-Agent to retrieve OpenGraph preview images from Threads
     headers = {
         "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -152,14 +153,14 @@ def extract_images_from_threads(url):
         image_bytes_list = []
         img_urls = []
 
-        # 1. Search for OpenGraph images (used for link previews)
+        # Find og:image meta tags
         og_images = soup.find_all('meta', property='og:image')
         for tag in og_images:
             content = tag.get('content')
             if content and content not in img_urls:
                 img_urls.append(content)
 
-        # 2. Search twitter card image fallback
+        # Fallback to twitter:image meta tags
         if not img_urls:
             tw_images = soup.find_all('meta', attrs={'name': 'twitter:image'})
             for tag in tw_images:
@@ -167,7 +168,6 @@ def extract_images_from_threads(url):
                 if content and content not in img_urls:
                     img_urls.append(content)
 
-        # Download discovered images
         dl_headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
@@ -175,7 +175,7 @@ def extract_images_from_threads(url):
         for img_url in img_urls:
             try:
                 img_resp = requests.get(img_url, headers=dl_headers, timeout=10)
-                if img_resp.status_code == 200 and len(img_resp.content) > 5000: # filter out tiny icons
+                if img_resp.status_code == 200 and len(img_resp.content) > 5000:
                     image_bytes_list.append(img_resp.content)
             except Exception as err:
                 logging.error(f"Error fetching image {img_url}: {err}")
@@ -185,43 +185,6 @@ def extract_images_from_threads(url):
     except Exception as e:
         logging.error(f"Threads extraction exception: {e}")
         return []
-
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9"
-    }
-    
-    response = requests.get(url, headers=headers, timeout=15)
-    if response.status_code != 200:
-        return []
-
-    soup = BeautifulSoup(response.text, 'html.parser')
-    image_bytes_list = []
-
-    # Meta tag image extraction (og:image)
-    og_images = soup.find_all('meta', property='og:image')
-    img_urls = set()
-    
-    for tag in og_images:
-        content = tag.get('content')
-        if content and ('scontent' in content or 'fbcdn' in content):
-            img_urls.add(content)
-
-    # Fallback to general image tags if meta tags are missing
-    if not img_urls:
-        for img in soup.find_all('img'):
-            src = img.get('src')
-            if src and ('scontent' in src or 'fbcdn' in src):
-                img_urls.add(src)
-
-    for img_url in img_urls:
-        try:
-            img_resp = requests.get(img_url, headers=headers, timeout=10)
-            if img_resp.status_code == 200:
-                image_bytes_list.append(img_resp.content)
-        except Exception as err:
-            logging.error(f"Error fetching image {img_url}: {err}")
-
-    return image_bytes_list
 
 # --- MAIN KEYBOARD ---
 def get_main_keyboard():
@@ -463,14 +426,13 @@ def handle_action_choice(call):
         session['pdfs'].append(pdf_bytes)
         bot.send_message(chat_id, f"📑 Added to Merge queue! ({len(session['pdfs'])} total). Send another PDF or tap 'Merge PDFs' in main menu.")
 
-# --- TEXT RESPONSES FOR INPUT MODES & THREADS LINKS ---
+# --- TEXT RESPONSES & THREADS LINKS ---
 @bot.message_handler(func=lambda msg: True)
 def handle_text_inputs(message):
     session = get_user_session(message.chat.id)
     chat_id = message.chat.id
     text = message.text.strip()
 
-    # Check if text contains a Threads URL directly or state is set
     threads_match = re.search(r'https?://(?:www\.)?threads\.net/[^\s]+', text)
     
     if threads_match or session['state'] == 'WAIT_THREADS_LINK':
