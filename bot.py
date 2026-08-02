@@ -1,5 +1,6 @@
 import os
 import io
+import time
 import logging
 from PIL import Image, ImageEnhance
 from pypdf import PdfReader, PdfWriter
@@ -310,15 +311,12 @@ def handle_action_choice(call):
         bot.answer_callback_query(call.id, "Please re-send your PDF file.")
         return
 
-    # FIXED PDF COMPRESS METHOD
     if action == "compress":
         bot.answer_callback_query(call.id, "Compressing PDF...")
         bot.send_message(chat_id, "⏳ <i>Compressing PDF... Please wait.</i>")
         try:
             reader = PdfReader(io.BytesIO(pdf_bytes))
             writer = PdfWriter()
-            
-            # Copy and compress safely
             writer.append(reader)
             for page in writer.pages:
                 page.compress_content_streams()
@@ -393,7 +391,6 @@ def handle_text_inputs(message):
             writer = PdfWriter()
             writer.append(reader)
             
-            # Delete pages from back to front to avoid index shifting
             for p_num in sorted(list(pages_to_remove), reverse=True):
                 if 1 <= p_num <= len(writer.pages):
                     writer.remove_page(p_num - 1)
@@ -506,5 +503,10 @@ def handle_callbacks(call):
             reset_user_session(chat_id)
 
 if __name__ == "__main__":
-    logging.info("PDF Telegram Bot is running...")
-    bot.infinity_polling(skip_pending=True)
+    logging.info("PDF Telegram Bot starting resilience loop...")
+    while True:
+        try:
+            bot.infinity_polling(timeout=20, long_polling_timeout=10, skip_pending=True)
+        except Exception as err:
+            logging.error(f"Polling connection error encountered: {err}")
+            time.sleep(3)
