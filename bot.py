@@ -86,12 +86,10 @@ def process_images_to_pdf(image_bytes_list, layout_mode="1_per_page"):
             is_tall = first_img.height > first_img.width
 
             if is_tall:
-                # SIDE BY SIDE (Left & Right)
                 box_w = A4_WIDTH // 2
                 box_h = A4_HEIGHT
                 positions = [(0, 0), (box_w, 0)]
             else:
-                # TOP AND BOTTOM (Up & Down)
                 box_w = A4_WIDTH
                 box_h = A4_HEIGHT // 2
                 positions = [(0, 0), (0, box_h)]
@@ -134,13 +132,15 @@ def process_images_to_pdf(image_bytes_list, layout_mode="1_per_page"):
         return output_buffer
     return None
 
-# --- THREADS IMAGE EXTRACTOR ---
+# --- ADVANCED THREADS MULTI-IMAGE CAROUSEL EXTRACTOR ---
 def extract_images_from_threads(url):
-    # Uses Facebook crawler User-Agent to retrieve OpenGraph preview images from Threads
     headers = {
-        "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "cross-site",
     }
     
     try:
@@ -149,36 +149,48 @@ def extract_images_from_threads(url):
             logging.error(f"Threads request failed status: {response.status_code}")
             return []
 
-        soup = BeautifulSoup(response.text, 'html.parser')
-        image_bytes_list = []
+        html_content = response.text
         img_urls = []
 
-        # Find og:image meta tags
-        og_images = soup.find_all('meta', property='og:image')
-        for tag in og_images:
-            content = tag.get('content')
-            if content and content not in img_urls:
-                img_urls.append(content)
+        # Find all high-res CDN image links in embedded JSON payload
+        raw_urls = re.findall(r'https://scontent[^\s"\'\\]+', html_content)
+        if not raw_urls:
+            raw_urls = re.findall(r'https://[^\s"\'\\]*fbcdn[^\s"\'\\]+', html_content)
 
-        # Fallback to twitter:image meta tags
+        for u in raw_urls:
+            # Clean up escaped JSON string formatting
+            clean_url = u.replace('\\/', '/').replace('\\u0026', '&')
+            
+            # Filter out profile pictures, low-res thumbnails, and duplicate entries
+            if any(x in clean_url for x in ['_s.jpg', '_a.jpg', 'p150x150', 'p50x50', '150x150', '50x50']):
+                continue
+            
+            if clean_url not in img_urls:
+                img_urls.append(clean_url)
+
+        # Fallback to meta tags if JSON parsing returns nothing
         if not img_urls:
-            tw_images = soup.find_all('meta', attrs={'name': 'twitter:image'})
-            for tag in tw_images:
+            soup = BeautifulSoup(html_content, 'html.parser')
+            for tag in soup.find_all('meta', property='og:image'):
                 content = tag.get('content')
                 if content and content not in img_urls:
                     img_urls.append(content)
 
+        logging.info(f"Extracted {len(img_urls)} unique image URLs from Threads.")
+
+        image_bytes_list = []
         dl_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         }
 
         for img_url in img_urls:
             try:
                 img_resp = requests.get(img_url, headers=dl_headers, timeout=10)
-                if img_resp.status_code == 200 and len(img_resp.content) > 5000:
+                # Keep original high-res photos (>15KB)
+                if img_resp.status_code == 200 and len(img_resp.content) > 15000:
                     image_bytes_list.append(img_resp.content)
             except Exception as err:
-                logging.error(f"Error fetching image {img_url}: {err}")
+                logging.error(f"Error downloading image {img_url}: {err}")
 
         return image_bytes_list
 
@@ -433,7 +445,7 @@ def handle_text_inputs(message):
     chat_id = message.chat.id
     text = message.text.strip()
 
-    threads_match = re.search(r'https?://(?:www\.)?threads\.net/[^\s]+', text)
+    threads_match = re.search(r'https?://(?:www\.)?threads\.(?:net|com)/[^\s]+', text)
     
     if threads_match or session['state'] == 'WAIT_THREADS_LINK':
         url = threads_match.group(0) if threads_match else text
@@ -441,7 +453,7 @@ def handle_text_inputs(message):
             bot.send_message(chat_id, "❌ Invalid URL format. Send a valid Threads post link.")
             return
 
-        bot.send_message(chat_id, "🔍 <i>Fetching images from Threads post... Please wait.</i>")
+        bot.send_message(chat_id, "🔍 <i>Fetching all photos from Threads post... Please wait.</i>")
         
         try:
             images = extract_images_from_threads(url)
@@ -456,7 +468,7 @@ def handle_text_inputs(message):
                 bot.send_document(
                     chat_id,
                     ("threads_post.pdf", pdf_buffer.getvalue()),
-                    caption=f"✅ <b>Threads Post PDF Ready!</b>\n\nDownloaded {len(images)} images."
+                    caption=f"✅ <b>Threads Post PDF Ready!</b>\n\nDownloaded all {len(images)} images."
                 )
             else:
                 bot.send_message(chat_id, "❌ Error generating PDF from post images.")
