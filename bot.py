@@ -26,6 +26,7 @@ import requests
 from bs4 import BeautifulSoup
 from PIL import Image, ImageEnhance, ImageOps
 from pypdf import PdfReader, PdfWriter
+import yt_dlp
 import telebot
 from telebot import types
 
@@ -108,69 +109,60 @@ def process_images_to_pdf(image_bytes_list, layout_mode="1_per_page"):
         return output_buffer
     return None
 
-# --- ULTIMATE THREADS SCRAPER (HANDLES THREADS.COM / SHARE LINKS / OPENGRAPH) ---
+# --- RELIABLE THREADS EXTRACTION USING YT-DLP ---
 def extract_images_from_threads(threads_url):
-    mobile_headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
-    }
+    image_urls = []
 
-    # 1. Convert app share links (threads.com/share/...) into real target URLs
+    # 1. Resolve redirect for share links
     try:
         if "/share/" in threads_url:
-            res = requests.get(threads_url, headers=mobile_headers, allow_redirects=True, timeout=10)
-            threads_url = res.url
+            r = requests.get(
+                threads_url, 
+                headers={"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15"},
+                allow_redirects=True, 
+                timeout=10
+            )
+            threads_url = r.url
     except Exception as e:
-        logging.error(f"Redirect resolution failed: {e}")
+        logging.error(f"Share link redirect failed: {e}")
 
-    # 2. Extract code from URL (handles post, t, share)
-    match = re.search(r'/(?:post|t|share)/([A-Za-z0-9_-]+)', threads_url)
-    if not match:
-        logging.error(f"Could not extract post shortcode from URL: {threads_url}")
-        return []
-    
-    code = match.group(1)
-    img_urls = []
+    # 2. Extract media using yt-dlp
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': False,
+        'skip_download': True,
+    }
 
-    # Method 1: Scrape Embed HTML
     try:
-        embed_url = f"https://www.threads.net/t/{code}/embed"
-        res = requests.get(embed_url, headers=mobile_headers, timeout=8)
-        if res.status_code == 200:
-            found_urls = re.findall(r'https://scontent[^\s"\'<]+', res.text)
-            for u in found_urls:
-                clean_u = u.replace('\\u0026', '&').replace('\\/', '/')
-                # Filter out profile pictures & icons
-                if not any(x in clean_u for x in ['s150x150', 's320x320', 'p150x150', '150x150']):
-                    if clean_u not in img_urls:
-                        img_urls.append(clean_u)
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(threads_url, download=False)
+            
+            # Carousel with multiple items
+            if 'entries' in info and info['entries']:
+                for entry in info['entries']:
+                    if entry.get('url'):
+                        image_urls.append(entry['url'])
+                    elif entry.get('thumbnails'):
+                        image_urls.append(entry['thumbnails'][-1]['url'])
+            # Single image post
+            elif info.get('url'):
+                image_urls.append(info['url'])
+            elif info.get('thumbnails'):
+                image_urls.append(info['thumbnails'][-1]['url'])
     except Exception as e:
-        logging.error(f"Embed method error: {e}")
+        logging.error(f"yt-dlp extraction failed: {e}")
 
-    # Method 2: Open Graph Meta Tag Scraping (Fallback)
-    if not img_urls:
-        try:
-            target_page = f"https://www.threads.net/t/{code}"
-            res = requests.get(target_page, headers=mobile_headers, timeout=8)
-            if res.status_code == 200:
-                soup = BeautifulSoup(res.text, 'html.parser')
-                meta_tags = soup.find_all('meta', property='og:image')
-                for tag in meta_tags:
-                    content = tag.get('content')
-                    if content and content not in img_urls:
-                        img_urls.append(content)
-        except Exception as e:
-            logging.error(f"Meta tag fallback error: {e}")
-
-    # 3. Download image content bytes
+    # 3. Download raw image bytes
     image_bytes_list = []
     headers = {"User-Agent": "Mozilla/5.0"}
-    for url in img_urls:
+    for url in image_urls:
         try:
-            r = requests.get(url, headers=headers, timeout=8)
+            r = requests.get(url, headers=headers, timeout=10)
             if r.status_code == 200 and len(r.content) > 10000:
                 image_bytes_list.append(r.content)
         except Exception as err:
-            logging.error(f"Download fail: {err}")
+            logging.error(f"Image download fail: {err}")
 
     return image_bytes_list
 
@@ -372,7 +364,6 @@ def handle_text_inputs(message):
     chat_id = message.chat.id
     text = message.text.strip()
 
-    # Matches threads.com and threads.net URLs
     threads_match = re.search(r'https?://(?:www\.)?threads\.(?:net|com)/[^\s]+', text)
     
     if threads_match or session['state'] == 'WAIT_THREADS_LINK':
