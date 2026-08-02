@@ -132,96 +132,114 @@ def process_images_to_pdf(image_bytes_list, layout_mode="1_per_page"):
         return output_buffer
     return None
 
-# --- BYPASS META BLOCKS (THREADS & INSTAGRAM SCRAPER) ---
+# --- BYPASS META BLOCKS (RELIABLE THREADS & INSTAGRAM SCRAPER) ---
 def extract_images_from_social_link(url):
-    # facebookexternalhit bypasses Meta login wall
     headers = {
-        'User-Agent': 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
     }
     
     img_urls = []
 
     try:
-        # --- INSTAGRAM POSTS & REELS ---
+        # --- INSTAGRAM HANDLING ---
         if 'instagram.com' in url:
-            match = re.search(r'instagram\.com/(?:p|reel|reels)/([^/?#&]+)', url)
+            match = re.search(r'instagram\.com/(?:p|reel|reels|tv)/([^/?#&]+)', url)
             if match:
                 shortcode = match.group(1)
-                embed_url = f"https://www.instagram.com/p/{shortcode}/embed/"
-                resp = requests.get(embed_url, headers=headers, timeout=12)
-                
-                if resp.status_code == 200:
-                    soup = BeautifulSoup(resp.text, 'html.parser')
-                    
-                    # Search for embedded carousel and post images
-                    img_tags = soup.find_all('img', class_=re.compile(r'EmbeddedMediaImage|FFVAD'))
-                    for img in img_tags:
-                        src = img.get('src')
-                        if src and 'scontent' in src and src not in img_urls:
-                            img_urls.append(src)
-                            
-                    # Fallback to OpenGraph image tag
-                    if not img_urls:
-                        og_img = soup.find('meta', property='og:image')
-                        if og_img and og_img.get('content'):
-                            img_urls.append(og_img['content'])
 
-        # --- THREADS POSTS ---
+                # Method 1: Fetch via DDInstagram API
+                try:
+                    proxy_url = f"https://api.ddinstagram.com/post/{shortcode}"
+                    resp = requests.get(proxy_url, headers=headers, timeout=8)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        if 'item' in data:
+                            item = data['item']
+                            # Carousel photos
+                            if 'carousel_media' in item:
+                                for media in item['carousel_media']:
+                                    candidates = media.get('image_versions2', {}).get('candidates', [])
+                                    if candidates:
+                                        img_urls.append(candidates[0]['url'])
+                            # Single photo
+                            elif 'image_versions2' in item:
+                                candidates = item['image_versions2'].get('candidates', [])
+                                if candidates:
+                                    img_urls.append(candidates[0]['url'])
+                except Exception as e:
+                    logging.warning(f"DDInstagram API fallback triggered: {e}")
+
+                # Method 2: Fallback to Public Instagram Embed
+                if not img_urls:
+                    embed_url = f"https://www.instagram.com/p/{shortcode}/embed/captioned/"
+                    resp = requests.get(embed_url, headers=headers, timeout=10)
+                    if resp.status_code == 200:
+                        soup = BeautifulSoup(resp.text, 'html.parser')
+                        for img in soup.find_all('img'):
+                            src = img.get('src')
+                            if src and 'scontent' in src and '150x150' not in src and src not in img_urls:
+                                img_urls.append(src)
+
+                        if not img_urls:
+                            og_img = soup.find('meta', property='og:image')
+                            if og_img and og_img.get('content'):
+                                img_urls.append(og_img['content'])
+
+        # --- THREADS HANDLING ---
         elif 'threads' in url:
             clean_url = url.split('?')[0]
             
-            # Method 1: Threads oEmbed API
-            oembed_url = f"https://www.threads.net/oembed?url={clean_url}"
+            # Method 1: FixThreads Proxy
             try:
-                oembed_resp = requests.get(oembed_url, headers=headers, timeout=6)
-                if oembed_resp.status_code == 200:
-                    data = oembed_resp.json()
-                    if data.get('thumbnail_url'):
-                        img_urls.append(data['thumbnail_url'])
-            except Exception:
-                pass
-
-            # Method 2: Fallback HTML Scraping
-            if not img_urls:
-                resp = requests.get(clean_url, headers=headers, timeout=12)
+                fix_url = clean_url.replace('threads.net', 'fixthreads.net').replace('threads.com', 'fixthreads.net')
+                fix_headers = {'User-Agent': 'telegrambot'}
+                resp = requests.get(fix_url, headers=fix_headers, timeout=8)
                 if resp.status_code == 200:
-                    html_content = resp.text
-                    
-                    # Deep scan JSON payload for high-res CDN images
-                    raw_urls = re.findall(r'https://scontent[^\s"\'\\]+', html_content)
-                    if not raw_urls:
-                        raw_urls = re.findall(r'https://[^\s"\'\\]*fbcdn[^\s"\'\\]+', html_content)
+                    soup = BeautifulSoup(resp.text, 'html.parser')
+                    for meta in soup.find_all('meta', property='og:image'):
+                        content = meta.get('content')
+                        if content and content not in img_urls:
+                            img_urls.append(content)
+            except Exception as e:
+                logging.warning(f"FixThreads proxy fallback triggered: {e}")
 
+            # Method 2: Threads oEmbed API
+            if not img_urls:
+                try:
+                    oembed_url = f"https://www.threads.net/oembed?url={clean_url}"
+                    oembed_resp = requests.get(oembed_url, headers=headers, timeout=6)
+                    if oembed_resp.status_code == 200:
+                        data = oembed_resp.json()
+                        if data.get('thumbnail_url'):
+                            img_urls.append(data['thumbnail_url'])
+                except Exception:
+                    pass
+
+            # Method 3: Direct Meta Crawler Payload Scraping
+            if not img_urls:
+                fb_headers = {'User-Agent': 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)'}
+                resp = requests.get(clean_url, headers=fb_headers, timeout=10)
+                if resp.status_code == 200:
+                    raw_urls = re.findall(r'https://scontent[^\s"\'\\]+', resp.text)
                     for u in raw_urls:
                         clean_u = u.replace('\\/', '/').replace('\\u0026', '&')
-                        if any(x in clean_u for x in ['_s.jpg', '_a.jpg', 'p150x150', 'p50x50', '150x150']):
-                            continue
-                        if clean_u not in img_urls:
-                            img_urls.append(clean_u)
+                        if not any(x in clean_u for x in ['_s.jpg', 'p150x150', 'p50x50', '150x150']):
+                            if clean_u not in img_urls:
+                                img_urls.append(clean_u)
 
-                    if not img_urls:
-                        soup = BeautifulSoup(html_content, 'html.parser')
-                        for tag in soup.find_all('meta', property='og:image'):
-                            content = tag.get('content')
-                            if content and content not in img_urls:
-                                img_urls.append(content)
+        logging.info(f"Successfully extracted {len(img_urls)} image URLs.")
 
-        logging.info(f"Extracted {len(img_urls)} image URLs from post.")
-
-        # Download extracted image binaries
+        # Download raw image bytes
         image_bytes_list = []
-        dl_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        }
-
         for img_url in img_urls:
             try:
-                img_resp = requests.get(img_url, headers=dl_headers, timeout=10)
-                if img_resp.status_code == 200 and len(img_resp.content) > 10000:
+                img_resp = requests.get(img_url, headers=headers, timeout=10)
+                if img_resp.status_code == 200 and len(img_resp.content) > 5000:
                     image_bytes_list.append(img_resp.content)
             except Exception as err:
-                logging.error(f"Error downloading image from {img_url}: {err}")
+                logging.error(f"Error downloading image: {err}")
 
         return image_bytes_list
 
@@ -398,7 +416,7 @@ def handle_document(message):
         reply_markup=markup
     )
 
-# --- ACTION CALLBACKS ---
+# --- ACTION CALLBACKS FOR SENT PDFS ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("act_"))
 def handle_action_choice(call):
     session = get_user_session(call.message.chat.id)
