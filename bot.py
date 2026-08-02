@@ -1,13 +1,12 @@
 import os
 import io
 import re
-import time
 import json
 import logging
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# 1. WEBSERVER FOR RENDER HEALTH CHECKS
+# 1. RENDER HEALTH CHECK SERVER
 class DummyServer(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -21,12 +20,10 @@ def run_dummy_server():
 
 threading.Thread(target=run_dummy_server, daemon=True).start()
 
-# 2. BOT IMPORTS
+# 2. BOT DEPENDENCIES
 import requests
-from bs4 import BeautifulSoup
 from PIL import Image, ImageEnhance, ImageOps
 from pypdf import PdfReader, PdfWriter
-import yt_dlp
 import telebot
 from telebot import types
 
@@ -65,6 +62,85 @@ def reset_user_session(chat_id):
             "active_pdf_name": "document.pdf"
         }
 
+# --- STEP 1: DIRECT META MEDIA EXTRACTOR (INSTAGRAM & THREADS) ---
+def fetch_meta_post_images(url):
+    """
+    Directly extracts image CDN links from Instagram & Threads posts 
+    using public JSON/GraphQL API endpoints.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+        "Accept": "*/*",
+        "X-IG-App-ID": "936619743392459"  # Instagram/Threads Public App ID
+    }
+
+    # Resolve short share redirects first
+    try:
+        if "/share/" in url or "threads.com" in url or "instagr.am" in url:
+            r = requests.get(url, headers=headers, allow_redirects=True, timeout=8)
+            url = r.url
+    except Exception as e:
+        logging.error(f"Redirect failed: {e}")
+
+    # Extract shortcode (e.g., Cxxxxxx or 40aVA-GF...)
+    match = re.search(r'/(?:p|post|reel|t|share)/([A-Za-z0-9_-]+)', url)
+    if not match:
+        return []
+    
+    code = match.group(1)
+    img_urls = []
+
+    # API Attempt 1: Instagram/Threads GraphQL Post API Endpoint
+    try:
+        api_url = f"https://www.instagram.com/p/{code}/?__a=1&__d=dis"
+        res = requests.get(api_url, headers=headers, timeout=8)
+        if res.status_code == 200:
+            data = res.json()
+            items = data.get('items', [{}])[0]
+            
+            # Carousel Multi-Photo Post
+            if 'carousel_media' in items:
+                for media in items['carousel_media']:
+                    candidates = media.get('image_versions2', {}).get('candidates', [])
+                    if candidates:
+                        img_urls.append(candidates[0]['url'])
+            # Single Photo Post
+            elif 'image_versions2' in items:
+                candidates = items['image_versions2'].get('candidates', [])
+                if candidates:
+                    img_urls.append(candidates[0]['url'])
+    except Exception as e:
+        logging.error(f"API 1 failed: {e}")
+
+    # API Attempt 2: Direct Embed Scrape Fallback
+    if not img_urls:
+        try:
+            embed_url = f"https://www.threads.net/t/{code}/embed" if "threads" in url else f"https://www.instagram.com/p/{code}/embed"
+            res = requests.get(embed_url, headers=headers, timeout=8)
+            if res.status_code == 200:
+                # Search for scontent image URLs
+                found = re.findall(r'https://scontent[^\s"\'<]+', res.text)
+                for u in found:
+                    clean_u = u.replace('\\u0026', '&').replace('\\/', '/')
+                    if not any(x in clean_u for x in ['150x150', '320x320', '480x480']):
+                        if clean_u not in img_urls:
+                            img_urls.append(clean_u)
+        except Exception as e:
+            logging.error(f"API 2 failed: {e}")
+
+    # Step 1 Finish: Download raw image bytes from CDN
+    image_bytes_list = []
+    for img_url in img_urls:
+        try:
+            img_res = requests.get(img_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+            if img_res.status_code == 200 and len(img_res.content) > 10000:
+                image_bytes_list.append(img_res.content)
+        except Exception as err:
+            logging.error(f"Failed to download image byte: {err}")
+
+    return image_bytes_list
+
+# --- STEP 2: CONVERT IMAGES TO PDF ---
 def enhance_newspaper_image(pil_img):
     gray = pil_img.convert('L')
     enhancer = ImageEnhance.Contrast(gray)
@@ -92,7 +168,7 @@ def process_images_to_pdf(image_bytes_list, layout_mode="1_per_page"):
                 filled_img = ImageOps.fit(img, (A4_WIDTH, A4_HEIGHT), Image.Resampling.LANCZOS)
                 pdf_pages.append(filled_img)
         except Exception as e:
-            logging.error(f"Error processing image: {e}")
+            logging.error(f"Error processing image for PDF: {e}")
 
     output_buffer = io.BytesIO()
     if pdf_pages:
@@ -109,69 +185,12 @@ def process_images_to_pdf(image_bytes_list, layout_mode="1_per_page"):
         return output_buffer
     return None
 
-# --- RELIABLE THREADS EXTRACTION USING YT-DLP ---
-def extract_images_from_threads(threads_url):
-    image_urls = []
-
-    # 1. Resolve redirect for share links
-    try:
-        if "/share/" in threads_url:
-            r = requests.get(
-                threads_url, 
-                headers={"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15"},
-                allow_redirects=True, 
-                timeout=10
-            )
-            threads_url = r.url
-    except Exception as e:
-        logging.error(f"Share link redirect failed: {e}")
-
-    # 2. Extract media using yt-dlp
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'extract_flat': False,
-        'skip_download': True,
-    }
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(threads_url, download=False)
-            
-            # Carousel with multiple items
-            if 'entries' in info and info['entries']:
-                for entry in info['entries']:
-                    if entry.get('url'):
-                        image_urls.append(entry['url'])
-                    elif entry.get('thumbnails'):
-                        image_urls.append(entry['thumbnails'][-1]['url'])
-            # Single image post
-            elif info.get('url'):
-                image_urls.append(info['url'])
-            elif info.get('thumbnails'):
-                image_urls.append(info['thumbnails'][-1]['url'])
-    except Exception as e:
-        logging.error(f"yt-dlp extraction failed: {e}")
-
-    # 3. Download raw image bytes
-    image_bytes_list = []
-    headers = {"User-Agent": "Mozilla/5.0"}
-    for url in image_urls:
-        try:
-            r = requests.get(url, headers=headers, timeout=10)
-            if r.status_code == 200 and len(r.content) > 10000:
-                image_bytes_list.append(r.content)
-        except Exception as err:
-            logging.error(f"Image download fail: {err}")
-
-    return image_bytes_list
-
 # --- KEYBOARD MENU (ALL 9 BUTTONS) ---
 def get_main_keyboard():
     markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     btn1 = types.KeyboardButton("📸 Photos to PDF")
     btn2 = types.KeyboardButton("📰 Newspaper HD Scanner")
-    btn3 = types.KeyboardButton("🧵 Threads to PDF")
+    btn3 = types.KeyboardButton("🧵 Threads & Insta to PDF")
     btn4 = types.KeyboardButton("📑 Merge PDFs")
     btn5 = types.KeyboardButton("✂️ Delete PDF Pages")
     btn6 = types.KeyboardButton("🗜️ Compress PDF")
@@ -187,7 +206,7 @@ def send_welcome(message):
     reset_user_session(message.chat.id)
     welcome_text = (
         "<b>✨ Welcome to your PDF Organizer Bot!</b>\n\n"
-        "Select an option below, send a file, or paste a <b>Threads post link</b> to start:"
+        "Select an option below or send an <b>Instagram / Threads post link</b> to generate a PDF instantly:"
     )
     bot.send_message(message.chat.id, welcome_text, reply_markup=get_main_keyboard())
 
@@ -207,12 +226,12 @@ def newspaper_start(message):
     session['layout_mode'] = 'newspaper'
     bot.send_message(message.chat.id, "📰 <b>Newspaper HD Scanner Active!</b>\n\nSend your screenshots/photos now.")
 
-@bot.message_handler(func=lambda msg: msg.text == "🧵 Threads to PDF")
+@bot.message_handler(func=lambda msg: msg.text in ["🧵 Threads to PDF", "🧵 Threads & Insta to PDF"])
 def threads_start(message):
     reset_user_session(message.chat.id)
     session = get_user_session(message.chat.id)
     session['state'] = 'WAIT_THREADS_LINK'
-    bot.send_message(message.chat.id, "🧵 <b>Paste any Threads post URL below:</b>")
+    bot.send_message(message.chat.id, "🧵 <b>Paste any Instagram or Threads post link below:</b>")
 
 @bot.message_handler(func=lambda msg: msg.text == "📑 Merge PDFs")
 def merge_start(message):
@@ -357,21 +376,24 @@ def handle_action_choice(call):
         session['pdfs'].append(pdf_bytes)
         bot.send_message(chat_id, f"📑 Added to Merge queue! ({len(session['pdfs'])} total). Send another or tap Merge.")
 
-# --- TEXT & THREADS LINK INPUTS ---
+# --- INSTAGRAM & THREADS LINK PROCESSOR ---
 @bot.message_handler(func=lambda msg: True)
 def handle_text_inputs(message):
     session = get_user_session(message.chat.id)
     chat_id = message.chat.id
     text = message.text.strip()
 
-    threads_match = re.search(r'https?://(?:www\.)?threads\.(?:net|com)/[^\s]+', text)
+    # Detect Instagram or Threads link automatically
+    link_match = re.search(r'https?://(?:www\.)?(?:threads\.(?:net|com)|instagram\.com|instagr\.am)/[^\s]+', text)
     
-    if threads_match or session['state'] == 'WAIT_THREADS_LINK':
-        url = threads_match.group(0) if threads_match else text
-        bot.send_message(chat_id, "🔍 <i>Processing post slides...</i>")
+    if link_match or session['state'] == 'WAIT_THREADS_LINK':
+        url = link_match.group(0) if link_match else text
+        bot.send_message(chat_id, "🔍 <i>Downloading post images...</i>")
         try:
-            images = extract_images_from_threads(url)
-            if not images:
+            # 1. Download post images
+            image_bytes_list = fetch_meta_post_images(url)
+            
+            if not image_bytes_list:
                 bot.send_message(
                     chat_id, 
                     "❌ <b>Could not extract post images.</b>\n\n"
@@ -380,17 +402,19 @@ def handle_text_inputs(message):
                 )
                 return
 
-            bot.send_message(chat_id, f"✅ Found {len(images)} slide(s)! Generating PDF...")
-            pdf_buffer = process_images_to_pdf(images, session.get('layout_mode', '1_per_page'))
+            bot.send_message(chat_id, f"✅ Downloaded {len(image_bytes_list)} image(s)! Generating PDF...")
+            
+            # 2. Make PDF
+            pdf_buffer = process_images_to_pdf(image_bytes_list, session.get('layout_mode', '1_per_page'))
 
             if pdf_buffer:
                 bot.send_document(
                     chat_id, 
-                    ("threads_post.pdf", pdf_buffer.getvalue()), 
-                    caption=f"✅ <b>Threads PDF Ready!</b>\nExtracted {len(images)} slide(s)."
+                    ("social_post.pdf", pdf_buffer.getvalue()), 
+                    caption=f"✅ <b>PDF Ready!</b>\nConverted {len(image_bytes_list)} image(s)."
                 )
         except Exception as e:
-            bot.send_message(chat_id, f"❌ Error: {e}")
+            bot.send_message(chat_id, f"❌ Processing Error: {e}")
         finally:
             reset_user_session(chat_id)
 
