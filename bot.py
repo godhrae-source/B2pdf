@@ -1,8 +1,11 @@
 import os
 import io
+import re
 import time
 import logging
-from PIL import Image, ImageEnhance
+import requests
+from bs4 import BeautifulSoup
+from PIL import Image, ImageEnhance, ImageOps
 from pypdf import PdfReader, PdfWriter
 import telebot
 from telebot import types
@@ -66,63 +69,52 @@ def process_images_to_pdf(image_bytes_list, layout_mode="1_per_page"):
     if layout_mode == "newspaper":
         for img in loaded_imgs:
             enhanced = enhance_newspaper_image(img)
-            canvas = create_a4_canvas()
-            img_w, img_h = enhanced.size
-            ratio = min((A4_WIDTH - 80) / img_w, (A4_HEIGHT - 80) / img_h)
-            new_size = (int(img_w * ratio), int(img_h * ratio))
-            resized = enhanced.resize(new_size, Image.Resampling.LANCZOS)
-            offset = ((A4_WIDTH - new_size[0]) // 2, (A4_HEIGHT - new_size[1]) // 2)
-            canvas.paste(resized, offset)
-            pdf_pages.append(canvas)
+            filled_img = ImageOps.fit(enhanced, (A4_WIDTH, A4_HEIGHT), Image.Resampling.LANCZOS)
+            pdf_pages.append(filled_img)
 
     elif layout_mode == "1_per_page":
         for img in loaded_imgs:
-            canvas = create_a4_canvas()
-            img_w, img_h = img.size
-            ratio = min((A4_WIDTH - 60) / img_w, (A4_HEIGHT - 60) / img_h)
-            new_size = (int(img_w * ratio), int(img_h * ratio))
-            resized = img.resize(new_size, Image.Resampling.LANCZOS)
-            offset = ((A4_WIDTH - new_size[0]) // 2, (A4_HEIGHT - new_size[1]) // 2)
-            canvas.paste(resized, offset)
-            pdf_pages.append(canvas)
+            filled_img = ImageOps.fit(img, (A4_WIDTH, A4_HEIGHT), Image.Resampling.LANCZOS)
+            pdf_pages.append(filled_img)
 
     elif layout_mode == "2_per_page":
         for i in range(0, len(loaded_imgs), 2):
             canvas = create_a4_canvas()
             batch = loaded_imgs[i:i+2]
-            box_height = (A4_HEIGHT - 120) // 2
-            box_width = A4_WIDTH - 80
+            
+            first_img = batch[0]
+            is_tall = first_img.height > first_img.width
+
+            if is_tall:
+                box_w = A4_WIDTH // 2
+                box_h = A4_HEIGHT
+                positions = [(0, 0), (box_w, 0)]
+            else:
+                box_w = A4_WIDTH
+                box_h = A4_HEIGHT // 2
+                positions = [(0, 0), (0, box_h)]
+
             for idx, img in enumerate(batch):
-                img_w, img_h = img.size
-                ratio = min(box_width / img_w, box_height / img_h)
-                new_size = (int(img_w * ratio), int(img_h * ratio))
-                resized = img.resize(new_size, Image.Resampling.LANCZOS)
-                x_offset = (A4_WIDTH - new_size[0]) // 2
-                y_offset = 40 + idx * (box_height + 40) + (box_height - new_size[1]) // 2
-                canvas.paste(resized, (x_offset, y_offset))
+                cropped_img = ImageOps.fit(img, (box_w, box_h), Image.Resampling.LANCZOS)
+                canvas.paste(cropped_img, positions[idx])
+                
             pdf_pages.append(canvas)
 
     elif layout_mode == "4_per_page":
         for i in range(0, len(loaded_imgs), 4):
             canvas = create_a4_canvas()
             batch = loaded_imgs[i:i+4]
-            box_width = (A4_WIDTH - 120) // 2
-            box_height = (A4_HEIGHT - 120) // 2
+            box_w = A4_WIDTH // 2
+            box_h = A4_HEIGHT // 2
             positions = [
-                (40, 40),
-                (80 + box_width, 40),
-                (40, 80 + box_height),
-                (80 + box_width, 80 + box_height)
+                (0, 0),
+                (box_w, 0),
+                (0, box_h),
+                (box_w, box_h)
             ]
             for idx, img in enumerate(batch):
-                img_w, img_h = img.size
-                ratio = min(box_width / img_w, box_height / img_h)
-                new_size = (int(img_w * ratio), int(img_h * ratio))
-                resized = img.resize(new_size, Image.Resampling.LANCZOS)
-                pos_x, pos_y = positions[idx]
-                x_offset = pos_x + (box_width - new_size[0]) // 2
-                y_offset = pos_y + (box_height - new_size[1]) // 2
-                canvas.paste(resized, (x_offset, y_offset))
+                cropped_img = ImageOps.fit(img, (box_w, box_h), Image.Resampling.LANCZOS)
+                canvas.paste(cropped_img, positions[idx])
             pdf_pages.append(canvas)
 
     output_buffer = io.BytesIO()
@@ -140,17 +132,59 @@ def process_images_to_pdf(image_bytes_list, layout_mode="1_per_page"):
         return output_buffer
     return None
 
+# --- THREADS IMAGE EXTRACTOR FUNCTION ---
+def extract_images_from_threads(url):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9"
+    }
+    
+    response = requests.get(url, headers=headers, timeout=15)
+    if response.status_code != 200:
+        return []
+
+    soup = BeautifulSoup(response.text, 'html.parser')
+    image_bytes_list = []
+
+    # Meta tag image extraction (og:image)
+    og_images = soup.find_all('meta', property='og:image')
+    img_urls = set()
+    
+    for tag in og_images:
+        content = tag.get('content')
+        if content and ('scontent' in content or 'fbcdn' in content):
+            img_urls.add(content)
+
+    # Fallback to general image tags if meta tags are missing
+    if not img_urls:
+        for img in soup.find_all('img'):
+            src = img.get('src')
+            if src and ('scontent' in src or 'fbcdn' in src):
+                img_urls.add(src)
+
+    for img_url in img_urls:
+        try:
+            img_resp = requests.get(img_url, headers=headers, timeout=10)
+            if img_resp.status_code == 200:
+                image_bytes_list.append(img_resp.content)
+        except Exception as err:
+            logging.error(f"Error fetching image {img_url}: {err}")
+
+    return image_bytes_list
+
+# --- MAIN KEYBOARD ---
 def get_main_keyboard():
     markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     btn1 = types.KeyboardButton("📸 Photos to PDF")
     btn2 = types.KeyboardButton("📰 Newspaper HD Scanner")
-    btn3 = types.KeyboardButton("📑 Merge PDFs")
-    btn4 = types.KeyboardButton("✂️ Delete PDF Pages")
-    btn5 = types.KeyboardButton("🗜️ Compress PDF")
-    btn6 = types.KeyboardButton("🔒 Protect / Unlock PDF")
-    btn7 = types.KeyboardButton("📝 Extract Text")
-    btn8 = types.KeyboardButton("🔄 Home / Restart")
-    markup.add(btn1, btn2, btn3, btn4, btn5, btn6, btn7, btn8)
+    btn3 = types.KeyboardButton("🧵 Threads to PDF")
+    btn4 = types.KeyboardButton("📑 Merge PDFs")
+    btn5 = types.KeyboardButton("✂️ Delete PDF Pages")
+    btn6 = types.KeyboardButton("🗜️ Compress PDF")
+    btn7 = types.KeyboardButton("🔒 Protect / Unlock PDF")
+    btn8 = types.KeyboardButton("📝 Extract Text")
+    btn9 = types.KeyboardButton("🔄 Home / Restart")
+    markup.add(btn1, btn2, btn3, btn4, btn5, btn6, btn7, btn8, btn9)
     return markup
 
 @bot.message_handler(commands=['start', 'help'])
@@ -159,7 +193,7 @@ def send_welcome(message):
     reset_user_session(message.chat.id)
     welcome_text = (
         "<b>✨ Welcome to your PDF Organizer Bot!</b>\n\n"
-        "Select an option below or send any file directly to start:"
+        "Select an option below, send a file, or paste a <b>Threads post link</b> to start:"
     )
     bot.send_message(message.chat.id, welcome_text, reply_markup=get_main_keyboard())
 
@@ -190,6 +224,16 @@ def newspaper_start(message):
     session['state'] = 'COLLECTING_IMAGES'
     session['layout_mode'] = 'newspaper'
     bot.send_message(message.chat.id, "📰 <b>Newspaper HD Scanner Active!</b>\n\nSend your screenshot or photo clip now.")
+
+@bot.message_handler(func=lambda msg: msg.text == "🧵 Threads to PDF")
+def threads_start(message):
+    reset_user_session(message.chat.id)
+    session = get_user_session(message.chat.id)
+    session['state'] = 'WAIT_THREADS_LINK'
+    bot.send_message(
+        message.chat.id,
+        "🧵 <b>Threads Post to PDF:</b>\n\nPlease send/paste the Threads post URL.\n\n<i>Example:</i> <code>https://www.threads.net/@user/post/C123456789</code>"
+    )
 
 @bot.message_handler(func=lambda msg: msg.text == "📑 Merge PDFs")
 def merge_start(message):
@@ -280,7 +324,6 @@ def handle_document(message):
     file_info = bot.get_file(doc.file_id)
     pdf_bytes = bot.download_file(file_info.file_path)
 
-    # Store file bytes for action menu
     session['active_pdf_bytes'] = pdf_bytes
     session['active_pdf_name'] = doc.file_name
 
@@ -369,13 +412,48 @@ def handle_action_choice(call):
         session['pdfs'].append(pdf_bytes)
         bot.send_message(chat_id, f"📑 Added to Merge queue! ({len(session['pdfs'])} total). Send another PDF or tap 'Merge PDFs' in main menu.")
 
-# --- TEXT RESPONSES FOR INPUT MODES ---
+# --- TEXT RESPONSES FOR INPUT MODES & THREADS LINKS ---
 @bot.message_handler(func=lambda msg: True)
 def handle_text_inputs(message):
     session = get_user_session(message.chat.id)
     chat_id = message.chat.id
+    text = message.text.strip()
 
-    if session['state'] == 'WAIT_DELETE_PAGE_NUMS':
+    # Check if text contains a Threads URL directly or state is set
+    threads_match = re.search(r'https?://(?:www\.)?threads\.net/[^\s]+', text)
+    
+    if threads_match or session['state'] == 'WAIT_THREADS_LINK':
+        url = threads_match.group(0) if threads_match else text
+        if not url.startswith("http"):
+            bot.send_message(chat_id, "❌ Invalid URL format. Send a valid Threads post link.")
+            return
+
+        bot.send_message(chat_id, "🔍 <i>Fetching images from Threads post... Please wait.</i>")
+        
+        try:
+            images = extract_images_from_threads(url)
+            if not images:
+                bot.send_message(chat_id, "❌ Could not find any images in that Threads post or the link is private/invalid.")
+                return
+
+            bot.send_message(chat_id, f"✅ Found {len(images)} image(s)! Converting to PDF...")
+            pdf_buffer = process_images_to_pdf(images, layout_mode="1_per_page")
+
+            if pdf_buffer:
+                bot.send_document(
+                    chat_id,
+                    ("threads_post.pdf", pdf_buffer.getvalue()),
+                    caption=f"✅ <b>Threads Post PDF Ready!</b>\n\nDownloaded {len(images)} images."
+                )
+            else:
+                bot.send_message(chat_id, "❌ Error generating PDF from post images.")
+
+        except Exception as e:
+            bot.send_message(chat_id, f"❌ Failed to process Threads post: {e}")
+        finally:
+            reset_user_session(chat_id)
+
+    elif session['state'] == 'WAIT_DELETE_PAGE_NUMS':
         try:
             input_text = message.text
             pages_to_remove = set()
