@@ -3,3 +3,4 @@ requests
 Pillow
 pypdf
 beautifulsoup4
+yt-dlp
